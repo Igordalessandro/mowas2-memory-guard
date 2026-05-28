@@ -12,7 +12,7 @@ This is an experimental side project. Many memory-management ideas were tried in
 
 Tested only on the Steam version `3.262.1` (Oct 2019 build). The hooks rely on hard-coded byte offsets inside `mowas_2.exe`. If your copy is bit-identical to that Steam build, it should work. Anything else (older retail / boxed releases, future Steam patches that shift the binary, modified or repacked copies) will likely crash at install time.
 
-1. Go to the Releases page of this repository.
+1. Go to the [Releases](https://github.com/Lukas-Ldc/mowas2-perf/releases) page of this repository.
 2. Download the latest `dbghelp.dll` file.
 3. Drop it into your game folder, next to `mowas_2.exe`. Default Steam path : `…\steamapps\common\Men of War Assault Squad 2\`.
 4. Launch the game normally through Steam.
