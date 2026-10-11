@@ -50,11 +50,18 @@ int install_all(std::uintptr_t game_base) {
             continue;
         }
         bool ok = false;
+#if defined(__MINGW32__)
+        // llvm-mingw cannot emit x86 SEH for this C++ frame (it contains STL
+        // objects with cleanup state).  Module installers are trusted code and
+        // the allocator hooks retain their own signature validation.
+        ok = e.spec.install_fn(game_base);
+#else
         __try {
             ok = e.spec.install_fn(game_base);
         } __except (EXCEPTION_EXECUTE_HANDLER) {
             ok = false;
         }
+#endif
         e.attempted = true;
         e.installed = ok;
         if (ok) {

@@ -1,18 +1,30 @@
-// dbghelp.dll runtime proxy : forwards ImageNtHeader to the real system DLL.
+// dbghelp.dll runtime proxy : forwards the APIs used by the game to the real
+// system DLL.  In particular, MiniDumpWriteDump must be exported or the game's
+// own crash reporter cannot preserve a useful dump.
 // Windows dedups loaded modules by base name, so we copy the real one to
 // %TEMP% and LoadLibrary that copy.
 
 #include "shared/logging/logger.h"
 
+// windows.h may declare the system ImageNtHeader import.  Rename that
+// declaration in this translation unit because this file defines the proxy
+// export with the real name.
+#define ImageNtHeader SystemDeclared_ImageNtHeader
 #include <windows.h>
+#undef ImageNtHeader
 #include <cstdio>
 #include <cwchar>
 
-#pragma comment(linker, "/EXPORT:ImageNtHeader=_proxied_ImageNtHeader@4")
+#if defined(_MSC_VER) && !defined(__MINGW32__)
+#pragma comment(linker, "/EXPORT:ImageNtHeader=_ImageNtHeader@4")
+#pragma comment(linker, "/EXPORT:MiniDumpWriteDump=_MiniDumpWriteDump@28")
+#endif
 
 namespace {
 
 using PFN_ImageNtHeader = PIMAGE_NT_HEADERS (WINAPI *)(PVOID);
+using PFN_MiniDumpWriteDump = BOOL (WINAPI *)(
+    HANDLE, DWORD, HANDLE, DWORD, PVOID, PVOID, PVOID);
 
 constexpr LONG STATE_PENDING       = 0;
 constexpr LONG STATE_BUSY          = 1;
@@ -23,6 +35,7 @@ static volatile LONG     g_initOnce        = STATE_PENDING;
 static volatile LONG     g_initFailures    = 0;
 static HMODULE           g_realDbghelp     = nullptr;
 static PFN_ImageNtHeader g_pfnImageNtHeader = nullptr;
+static PFN_MiniDumpWriteDump g_pfnMiniDumpWriteDump = nullptr;
 
 constexpr int INIT_MAX_RETRIES   = 5;
 constexpr int INIT_SPIN_WAIT_MS  = 500;
@@ -72,6 +85,11 @@ static void ensure_init() {
     wchar_t copyPath[MAX_PATH] = {0};
     swprintf_s(copyPath, MAX_PATH, L"%smowas2_real_dbghelp.dll", tempDir);
 
+    // CopyFile preserves the system DLL's read-only attribute.  Without
+    // clearing it, every launch after the first fails with ACCESS_DENIED.
+    // Ignore FILE_NOT_FOUND on the first run.
+    SetFileAttributesW(copyPath, FILE_ATTRIBUTE_NORMAL);
+
     // SHARING_VIOLATION = previous run still maps the file, OK to reuse.
     // Anything else : refuse to load a possibly stale/tampered temp file.
     bool can_load = true;
@@ -83,6 +101,7 @@ static void ensure_init() {
             can_load = false;
         }
     }
+    SetFileAttributesW(copyPath, FILE_ATTRIBUTE_NORMAL);
     if (!can_load) {
         fail_init(false);
         return;
@@ -126,6 +145,12 @@ static void ensure_init() {
         fail_init(true);
         return;
     }
+    g_pfnMiniDumpWriteDump = reinterpret_cast<PFN_MiniDumpWriteDump>(
+        GetProcAddress(g_realDbghelp, "MiniDumpWriteDump"));
+    if (!g_pfnMiniDumpWriteDump) {
+        logger::log("dbghelp_proxy : GetProcAddress(MiniDumpWriteDump) FAILED err=%lu; crash dumps unavailable",
+                    GetLastError());
+    }
     logger::log("dbghelp_proxy : forwarded to %ws (handle=%p, self=%p)",
                 copyPath, g_realDbghelp, selfHandle);
     InterlockedExchange(&g_initFailures, 0);
@@ -134,9 +159,22 @@ static void ensure_init() {
 
 } // anonymous namespace
 
-extern "C" PIMAGE_NT_HEADERS WINAPI
-proxied_ImageNtHeader(PVOID Base) {
+extern "C" __declspec(dllexport) PIMAGE_NT_HEADERS WINAPI
+ImageNtHeader(PVOID Base) {
     ensure_init();
     if (!g_pfnImageNtHeader) return nullptr;
     return g_pfnImageNtHeader(Base);
+}
+
+extern "C" __declspec(dllexport) BOOL WINAPI
+MiniDumpWriteDump(HANDLE process, DWORD process_id, HANDLE file,
+                  DWORD dump_type, PVOID exception_info,
+                  PVOID user_stream_info, PVOID callback_info) {
+    ensure_init();
+    if (!g_pfnMiniDumpWriteDump) {
+        SetLastError(ERROR_PROC_NOT_FOUND);
+        return FALSE;
+    }
+    return g_pfnMiniDumpWriteDump(process, process_id, file, dump_type,
+                                  exception_info, user_stream_info, callback_info);
 }

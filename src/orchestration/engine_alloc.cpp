@@ -1,5 +1,6 @@
 #include "orchestration/hooks_internal.h"
 #include "app/config.h"
+#include "orchestration/memory_guard.h"
 #include "shared/logging/logger.h"
 
 #include <windows.h>
@@ -8,10 +9,17 @@
 PFN_EngineAlloc g_origEngineAlloc     = nullptr;
 PFN_EngineAlloc g_origEngineAllocCore = nullptr;
 
-static volatile LONG g_clampCount = 0;
+static volatile LONG g_workaroundCount = 0;
+static thread_local int g_hookDepth = 0;
 
-static inline size_t apply_clamp(size_t size, const char* hookName) {
-    if (size <= ALLOC_SANITY_LIMIT) return size;
+struct HookDepthScope {
+    bool outermost;
+    HookDepthScope() : outermost(g_hookDepth++ == 0) {}
+    ~HookDepthScope() { --g_hookDepth; }
+};
+
+static inline size_t apply_known_lobby_workaround(size_t size, const char* hookName) {
+    if (size != KNOWN_BAD_LOBBY_ALLOCATION) return size;
 
     void* stack[8] = {0};
     USHORT nFrames = RtlCaptureStackBackTrace(0, 8, stack, nullptr);
@@ -26,18 +34,35 @@ static inline size_t apply_clamp(size_t size, const char* hookName) {
         if (n < 0) break;
         written += n;
     }
-    LONG count = InterlockedIncrement(&g_clampCount);
-    logger::log("ALLOC CLAMPED #%ld (%s) : %zu bytes -> %d bytes [stack: %s]",
-                (long)count, hookName, size, ALLOC_CLAMP_REPLACEMENT, stackStr);
-    return ALLOC_CLAMP_REPLACEMENT;
+    LONG count = InterlockedIncrement(&g_workaroundCount);
+    logger::log("KNOWN LOBBY BUG WORKAROUND #%ld (%s) : %zu bytes -> %zu bytes [stack: %s]",
+                (long)count, hookName, size, LOBBY_ALLOCATION_REPLACEMENT, stackStr);
+    return LOBBY_ALLOCATION_REPLACEMENT;
+}
+
+static void* guarded_allocate(PFN_EngineAlloc original, size_t size, const char* hookName) {
+    if (!original) return nullptr;
+
+    HookDepthScope depth;
+    if (depth.outermost) {
+        size = apply_known_lobby_workaround(size, hookName);
+        memory_guard::record_request(size);
+        memory_guard::before_allocation(size);
+    }
+
+    void* result = original(size);
+    if (depth.outermost && !result) {
+        const bool released = memory_guard::release_after_failure();
+        if (released) result = original(size);
+        memory_guard::record_failure(size, hookName, result != nullptr);
+    }
+    return result;
 }
 
 void* __cdecl hooked_engineAlloc(size_t size) {
-    size = apply_clamp(size, "engineAlloc");
-    return g_origEngineAlloc ? g_origEngineAlloc(size) : nullptr;
+    return guarded_allocate(g_origEngineAlloc, size, "engineAlloc");
 }
 
 void* __cdecl hooked_engineAllocCore(size_t size) {
-    size = apply_clamp(size, "engineAllocCore");
-    return g_origEngineAllocCore ? g_origEngineAllocCore(size) : nullptr;
+    return guarded_allocate(g_origEngineAllocCore, size, "engineAllocCore");
 }
