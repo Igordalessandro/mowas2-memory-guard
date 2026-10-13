@@ -12,10 +12,12 @@
 #define KNOWN_BAD_LOBBY_ALLOCATION  ((size_t)2147483552u) // 0x7fffffa0
 #define LOBBY_ALLOCATION_REPLACEMENT ((size_t)(4u * 1024u * 1024u))
 
-// A reserved (not committed) virtual-address range is held until the 32-bit
-// process approaches exhaustion.  Releasing it gives the engine one last
-// contiguous region in which to finish cleanup or save a dump.
-#define EMERGENCY_RESERVE_MB         64u
+// Two reserved (not committed) virtual-address ranges are released in stages.
+// The primary block provides ordinary low-memory headroom.  The final block
+// stays unavailable until an allocator actually fails, avoiding the old
+// behavior where the whole reserve disappeared long before the final crash.
+#define PRIMARY_RESERVE_MB           48u
+#define FINAL_RESERVE_MB             16u
 #define RELEASE_TOTAL_FREE_MB       192u
 #define RELEASE_LARGEST_FREE_MB      24u
 #define TELEMETRY_INTERVAL_MS     30000u

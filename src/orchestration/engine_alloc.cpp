@@ -1,9 +1,11 @@
 #include "orchestration/hooks_internal.h"
 #include "app/config.h"
+#include "diagnostics/allocator_profiler.h"
 #include "orchestration/memory_guard.h"
 #include "shared/logging/logger.h"
 
 #include <windows.h>
+#include <intrin.h>
 #include <cstdio>
 
 PFN_EngineAlloc g_origEngineAlloc     = nullptr;
@@ -40,12 +42,14 @@ static inline size_t apply_known_lobby_workaround(size_t size, const char* hookN
     return LOBBY_ALLOCATION_REPLACEMENT;
 }
 
-static void* guarded_allocate(PFN_EngineAlloc original, size_t size, const char* hookName) {
+static void* guarded_allocate(PFN_EngineAlloc original, size_t size, const char* hookName,
+                              std::uintptr_t caller) {
     if (!original) return nullptr;
 
     HookDepthScope depth;
     if (depth.outermost) {
         size = apply_known_lobby_workaround(size, hookName);
+        allocator_profiler::record_engine_request(size, caller);
         memory_guard::record_request(size);
         memory_guard::before_allocation(size);
     }
@@ -54,15 +58,17 @@ static void* guarded_allocate(PFN_EngineAlloc original, size_t size, const char*
     if (depth.outermost && !result) {
         const bool released = memory_guard::release_after_failure();
         if (released) result = original(size);
-        memory_guard::record_failure(size, hookName, result != nullptr);
+        memory_guard::record_failure(size, hookName, released, result != nullptr);
     }
     return result;
 }
 
 void* __cdecl hooked_engineAlloc(size_t size) {
-    return guarded_allocate(g_origEngineAlloc, size, "engineAlloc");
+    return guarded_allocate(g_origEngineAlloc, size, "engineAlloc",
+                            reinterpret_cast<std::uintptr_t>(_ReturnAddress()));
 }
 
 void* __cdecl hooked_engineAllocCore(size_t size) {
-    return guarded_allocate(g_origEngineAllocCore, size, "engineAllocCore");
+    return guarded_allocate(g_origEngineAllocCore, size, "engineAllocCore",
+                            reinterpret_cast<std::uintptr_t>(_ReturnAddress()));
 }

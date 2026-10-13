@@ -15,6 +15,7 @@ void before_allocation(std::size_t size);
 bool release_after_failure();
 
 void record_request(std::size_t size);
-void record_failure(std::size_t size, const char* hook_name, bool retry_succeeded);
+void record_failure(std::size_t size, const char* hook_name,
+                    bool reserve_released, bool retry_succeeded);
 
 } // namespace memory_guard
