@@ -6,8 +6,6 @@
 #include <cstdint>
 #include <cstring>
 
-#include "MinHook.h"
-
 namespace vac_join_guard {
 namespace {
 
@@ -41,6 +39,8 @@ JoinLobbyFn g_original_join_lobby = nullptr;
 InitiateGameConnectionFn g_original_initiate = nullptr;
 void* g_join_lobby_target = nullptr;
 void* g_initiate_target = nullptr;
+void** g_join_lobby_slot = nullptr;
+void** g_initiate_slot = nullptr;
 volatile LONG g_installed = 0;
 volatile LONG g_warning_visible = 0;
 
@@ -160,24 +160,86 @@ int __fastcall guarded_initiate_game_connection(
                     secure);
 }
 
-bool create_and_enable_hook(
-    void* target,
+bool replace_vtable_slot(
+    void** slot,
     void* replacement,
     void** original,
     const char* name) {
-    MH_STATUS create_status = MH_CreateHook(target, replacement, original);
-    if (create_status != MH_OK) {
-        logger::log("VAC JOIN GUARD install failed: MH_CreateHook %s target=%p status=%d",
-                    name, target, static_cast<int>(create_status));
+    if (!slot || !replacement || !original) return false;
+
+    void* target = *slot;
+    if (!is_executable_address(target)) {
+        logger::log(
+            "VAC JOIN GUARD install failed: %s target is not executable target=%p slot=%p",
+            name, target, slot);
         return false;
     }
 
-    MH_STATUS enable_status = MH_EnableHook(target);
-    if (enable_status != MH_OK) {
-        logger::log("VAC JOIN GUARD install failed: MH_EnableHook %s target=%p status=%d",
-                    name, target, static_cast<int>(enable_status));
-        MH_RemoveHook(target);
+    DWORD old_protect = 0;
+    if (!VirtualProtect(slot, sizeof(*slot), PAGE_READWRITE, &old_protect)) {
+        logger::log(
+            "VAC JOIN GUARD install failed: VirtualProtect %s slot=%p error=%lu",
+            name, slot, GetLastError());
+        return false;
+    }
+
+    // Publish the original before the replacement can be called on another
+    // thread.  Only this interface's dispatch slot is changed.  In
+    // particular, do not inline-patch the implementation address: Proton can
+    // expose shared/generated Steam client entry points whose code is also
+    // used by unrelated friend and persona operations.
+    *original = target;
+    MemoryBarrier();
+    void* observed = InterlockedCompareExchangePointer(
+        reinterpret_cast<void* volatile*>(slot), replacement, target);
+
+    DWORD ignored = 0;
+    const BOOL protection_restored =
+        VirtualProtect(slot, sizeof(*slot), old_protect, &ignored);
+
+    if (observed != target) {
+        logger::log(
+            "VAC JOIN GUARD install failed: %s slot changed concurrently "
+            "slot=%p expected=%p observed=%p",
+            name, slot, target, observed);
         *original = nullptr;
+        return false;
+    }
+
+    if (!protection_restored) {
+        logger::log(
+            "VAC JOIN GUARD warning: could not restore %s vtable protection "
+            "slot=%p error=%lu",
+            name, slot, GetLastError());
+    }
+    return true;
+}
+
+bool restore_vtable_slot(
+    void** slot,
+    void* replacement,
+    void* original,
+    const char* name) {
+    if (!slot || !replacement || !original) return false;
+
+    DWORD old_protect = 0;
+    if (!VirtualProtect(slot, sizeof(*slot), PAGE_READWRITE, &old_protect)) {
+        logger::log(
+            "VAC JOIN GUARD rollback failed: VirtualProtect %s slot=%p error=%lu",
+            name, slot, GetLastError());
+        return false;
+    }
+
+    void* observed = InterlockedCompareExchangePointer(
+        reinterpret_cast<void* volatile*>(slot), original, replacement);
+    DWORD ignored = 0;
+    VirtualProtect(slot, sizeof(*slot), old_protect, &ignored);
+
+    if (observed != replacement) {
+        logger::log(
+            "VAC JOIN GUARD rollback failed: %s slot changed concurrently "
+            "slot=%p expected=%p observed=%p",
+            name, slot, replacement, observed);
         return false;
     }
     return true;
@@ -237,8 +299,10 @@ bool install() {
         return false;
     }
 
-    void* join_lobby_target = matchmaking_vtable[14];
-    void* initiate_target = user_vtable[3];
+    void** join_lobby_slot = &matchmaking_vtable[14];
+    void** initiate_slot = &user_vtable[3];
+    void* join_lobby_target = *join_lobby_slot;
+    void* initiate_target = *initiate_slot;
     if (!is_executable_address(join_lobby_target) ||
         !is_executable_address(initiate_target)) {
         logger::log(
@@ -248,42 +312,41 @@ bool install() {
         return false;
     }
 
-    MH_STATUS init_status = MH_Initialize();
-    if (init_status != MH_OK && init_status != MH_ERROR_ALREADY_INITIALIZED) {
-        logger::log("VAC JOIN GUARD install failed: MH_Initialize status=%d",
-                    static_cast<int>(init_status));
-        return false;
-    }
-    const bool mh_owned_here = init_status == MH_OK;
-
-    if (!create_and_enable_hook(
-            join_lobby_target,
+    if (!replace_vtable_slot(
+            join_lobby_slot,
             reinterpret_cast<void*>(&guarded_join_lobby),
             reinterpret_cast<void**>(&g_original_join_lobby),
             "JoinLobby")) {
-        if (mh_owned_here) MH_Uninitialize();
         return false;
     }
 
-    if (!create_and_enable_hook(
-            initiate_target,
+    if (!replace_vtable_slot(
+            initiate_slot,
             reinterpret_cast<void*>(&guarded_initiate_game_connection),
             reinterpret_cast<void**>(&g_original_initiate),
             "InitiateGameConnection")) {
-        MH_RemoveHook(join_lobby_target);
+        restore_vtable_slot(
+            join_lobby_slot,
+            reinterpret_cast<void*>(&guarded_join_lobby),
+            reinterpret_cast<void*>(g_original_join_lobby),
+            "JoinLobby");
         g_original_join_lobby = nullptr;
-        if (mh_owned_here) MH_Uninitialize();
         return false;
     }
 
     g_join_lobby_target = join_lobby_target;
     g_initiate_target = initiate_target;
+    g_join_lobby_slot = join_lobby_slot;
+    g_initiate_slot = initiate_slot;
     InterlockedExchange(&g_installed, 1);
     logger::log(
-        "VAC JOIN GUARD installed: JoinLobby=%p original=%p; "
-        "InitiateGameConnection=%p original=%p",
+        "VAC JOIN GUARD installed with interface-local vtable hooks: "
+        "JoinLobby slot=%p target=%p original=%p; "
+        "InitiateGameConnection slot=%p target=%p original=%p",
+        g_join_lobby_slot,
         g_join_lobby_target,
         reinterpret_cast<void*>(g_original_join_lobby),
+        g_initiate_slot,
         g_initiate_target,
         reinterpret_cast<void*>(g_original_initiate));
     return true;

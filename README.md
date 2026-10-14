@@ -113,6 +113,12 @@ identifies the lobby as insecure (`0`, `false`, or `no`). Secure, missing, and
 unknown values are blocked. A second guard rejects any later SteamUser018
 `InitiateGameConnection` request whose `bSecure` flag is true.
 
+The client guards replace only the relevant dispatch entries on the acquired
+Steam interfaces. They do not inline-patch Steam client's implementation
+functions. This distinction is important under Proton, where generated or
+shared Steam-client entry points can also service unrelated friend and persona
+operations; patching such code globally can produce incorrect player names.
+
 These are fail-closed refusal mechanisms. They do not disable VAC, forge VAC
 state, make a secure server insecure, or provide immunity from enforcement. If
 the host or join safeguards cannot be installed, the DLL closes the game rather
