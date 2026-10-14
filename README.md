@@ -117,17 +117,12 @@ game. Memory Guard intentionally leaves the visible checkbox unchanged, but it
 refuses `SteamGameServer_Init` if the game requests secure server mode. The user
 must uncheck **VAC Secured** and try hosting again.
 
-Before joining, the DLL reads the destination lobby's SteamMatchmaking009
-`secured` metadata. It calls `JoinLobby` only when the cached value explicitly
-identifies the lobby as insecure (`0`, `false`, or `no`). Secure, missing, and
-unknown values are blocked. A second guard rejects any later SteamUser018
-`InitiateGameConnection` request whose `bSecure` flag is true.
-
-The client guards replace only the relevant dispatch entries on the acquired
-Steam interfaces. They do not inline-patch Steam client's implementation
-functions. This distinction is important under Proton, where generated or
-shared Steam-client entry points can also service unrelated friend and persona
-operations; patching such code globally can produce incorrect player names.
+Before a secure game-server session can authenticate, the DLL rejects any
+SteamUser018 `InitiateGameConnection` request whose `bSecure` flag is true.
+The guard replaces only that interface's dispatch entry and does not patch or
+query SteamMatchmaking. Earlier experimental builds intercepted `JoinLobby`,
+but that was removed because touching the matchmaking interface could
+destabilize friend and persona names under Proton's WoW64 bridge.
 
 These are fail-closed refusal mechanisms. They do not disable VAC, forge VAC
 state, make a secure server insecure, or provide immunity from enforcement. If

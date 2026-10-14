@@ -112,7 +112,7 @@ bool init() {
     InterlockedExchange(&g_initState, INIT_DONE);
 
     log("============================================================");
-    log("mowas2-memory-guard v2.4 diagnostic loaded (allocator telemetry + secure guards)");
+    log("mowas2-memory-guard v2.4.2 candidate loaded (no SteamMatchmaking hooks)");
     log("Build: %s %s", __DATE__, __TIME__);
     log("============================================================");
 
