@@ -13,6 +13,13 @@ and refuses VAC-secured hosting and joining while the custom DLL is loaded.
 > contributors are not responsible for VAC bans, other account restrictions,
 > lost data, crashes, or any other damage. If account risk is unacceptable, do
 > not use this DLL in multiplayer.
+>
+> note from the developer: 
+> if you are reading this before reading the rest of the post:
+> keep in mind that this DLL has a safe-guard system to avoid creating or joining VAC servers
+> it has extensively been tested on both linux and windows and not a single problem so far.
+> extensively tested does not mean its 100% safe, just that nobody was unlucky so far.
+> i made this dll to play assault squad 2 with my girlfriend, we like base defense missions.
 
 ## Installation
 
