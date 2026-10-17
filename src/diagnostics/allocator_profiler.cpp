@@ -27,6 +27,10 @@ constexpr unsigned SAMPLE_CAPACITY = 16384;
 constexpr unsigned SAMPLE_RATE = 1024;
 constexpr unsigned ENGINE_SAMPLE_RATE = 4096;
 constexpr unsigned SAMPLE_PROBES = 16;
+constexpr unsigned HEAP_CAPACITY = 16;
+constexpr unsigned FLIGHT_CAPACITY = 256;
+constexpr unsigned PRESSURE_FLIGHT_RATE = 256;
+constexpr SIZE_T LARGE_FLIGHT_BYTES = 1024u * 1024u;
 constexpr DWORD SUMMARY_INTERVAL_MS = 30000;
 constexpr DWORD DETAIL_INTERVAL_MS = 120000;
 
@@ -38,43 +42,86 @@ static VirtualFreeFn g_originalVirtualFree = nullptr;
 static std::uintptr_t g_base = 0;
 static volatile LONG g_installed = 0;
 static thread_local unsigned g_engine_sample_counter = 0;
+static thread_local unsigned g_pressure_flight_counter = 0;
+static thread_local bool g_engine_context_active = false;
+static thread_local DWORD g_engine_context_rva = 0xFFFFFFFFu;
+static thread_local SIZE_T g_engine_context_size = 0;
+static thread_local HANDLE g_engine_context_heap = nullptr;
 
 __declspec(align(8)) struct CallsiteStat {
     volatile LONG rva;
-    volatile LONG alloc_calls;
-    volatile LONG realloc_calls;
-    volatile LONG free_calls;
+    volatile LONG64 alloc_calls;
+    volatile LONG64 realloc_calls;
+    volatile LONG64 free_calls;
     volatile LONG failures;
     volatile LONG sample_live_count;
     volatile LONG sample_free_count;
-    volatile LONG engine_sample_calls;
+    volatile LONG64 engine_sample_calls;
     volatile LONG64 requested_bytes;
     volatile LONG64 sample_live_bytes;
     volatile LONG64 sample_freed_bytes;
     volatile LONG64 sample_lifetime_ms;
     volatile LONG64 engine_sample_bytes;
 };
+static_assert(alignof(CallsiteStat) >= 8, "64-bit call-site counters must be aligned");
+static_assert(offsetof(CallsiteStat, alloc_calls) % 8 == 0,
+              "InterlockedIncrement64 requires aligned call counters");
 
 struct SampleEntry {
     void* pointer;
+    HANDLE heap;
     DWORD size;
     DWORD alloc_rva;
     DWORD tick;
 };
 
+__declspec(align(8)) struct HeapStat {
+    void* volatile handle;
+    volatile LONG compatibility;
+    volatile LONG sample_live_count;
+    volatile LONG64 sample_alloc_count;
+    volatile LONG64 sample_free_count;
+    volatile LONG64 sample_live_bytes;
+    volatile LONG64 sample_freed_bytes;
+};
+static_assert(alignof(HeapStat) >= 8, "64-bit heap counters must be aligned");
+static_assert(offsetof(HeapStat, sample_alloc_count) % 8 == 0,
+              "InterlockedIncrement64 requires aligned heap counters");
+
+enum FlightFlags : DWORD {
+    FLIGHT_LARGE = 1u,
+    FLIGHT_PRESSURE = 2u,
+    FLIGHT_FAILURE = 4u,
+    FLIGHT_RECOVERED = 8u,
+};
+
+__declspec(align(8)) struct FlightEvent {
+    volatile LONG sequence;
+    DWORD tick;
+    DWORD thread_id;
+    DWORD caller_rva;
+    DWORD size;
+    DWORD flags;
+    void* result;
+    HANDLE heap;
+};
+
 static CallsiteStat g_callsites[CALLSITE_CAPACITY] = {};
 static SampleEntry g_samples[SAMPLE_CAPACITY] = {};
+static HeapStat g_heaps[HEAP_CAPACITY] = {};
+static FlightEvent g_flight[FLIGHT_CAPACITY] = {};
 static volatile LONG g_sample_lock = 0;
+static volatile LONG g_flight_sequence = 0;
 static volatile LONG g_sample_entries = 0;
 static volatile LONG g_sample_drops = 0;
 static volatile LONG g_callsite_drops = 0;
 
-static volatile LONG g_heap_alloc_calls = 0;
-static volatile LONG g_heap_realloc_calls = 0;
-static volatile LONG g_heap_free_calls = 0;
+__declspec(align(8)) static volatile LONG64 g_heap_alloc_calls = 0;
+__declspec(align(8)) static volatile LONG64 g_heap_realloc_calls = 0;
+__declspec(align(8)) static volatile LONG64 g_heap_free_calls = 0;
 static volatile LONG g_heap_failures = 0;
-static volatile LONG g_virtual_alloc_calls = 0;
-static volatile LONG g_virtual_free_calls = 0;
+__declspec(align(8)) static volatile LONG64 g_virtual_alloc_calls = 0;
+__declspec(align(8)) static volatile LONG64 g_virtual_free_calls = 0;
 static volatile LONG g_virtual_failures = 0;
 __declspec(align(8)) static volatile LONG64 g_heap_requested_bytes = 0;
 __declspec(align(8)) static volatile LONG64 g_virtual_requested_bytes = 0;
@@ -132,6 +179,58 @@ static LONG64 load64(volatile LONG64* value) {
     return InterlockedCompareExchange64(value, 0, 0);
 }
 
+static DWORD to_game_rva(std::uintptr_t caller) {
+    return caller >= g_base && caller < g_base + TARGET_IMAGE_SIZE
+        ? static_cast<DWORD>(caller - g_base) : 0xFFFFFFFFu;
+}
+
+static HeapStat* heap_stat_for(HANDLE heap) {
+    if (!heap) return nullptr;
+    unsigned index = (static_cast<unsigned>(reinterpret_cast<std::uintptr_t>(heap)) >> 3u) &
+                     (HEAP_CAPACITY - 1u);
+    for (unsigned probe = 0; probe < HEAP_CAPACITY; ++probe) {
+        HeapStat& slot = g_heaps[(index + probe) & (HEAP_CAPACITY - 1u)];
+        void* observed = slot.handle;
+        if (observed == heap) return &slot;
+        if (!observed) {
+            observed = InterlockedCompareExchangePointer(&slot.handle, heap, nullptr);
+            if (!observed || observed == heap) {
+                if (!observed) {
+                    ULONG compatibility = 0;
+                    SIZE_T returned = 0;
+                    const BOOL queried = HeapQueryInformation(
+                        heap, HeapCompatibilityInformation,
+                        &compatibility, sizeof(compatibility), &returned);
+                    InterlockedExchange(&slot.compatibility,
+                                        queried ? static_cast<LONG>(compatibility) : -1);
+                }
+                return &slot;
+            }
+        }
+    }
+    return nullptr;
+}
+
+static void record_flight_event(SIZE_T size, DWORD caller_rva_value, void* result,
+                                HANDLE heap, DWORD flags) {
+    const LONG sequence = InterlockedIncrement(&g_flight_sequence);
+    FlightEvent& event = g_flight[
+        (static_cast<unsigned>(sequence) - 1u) & (FLIGHT_CAPACITY - 1u)];
+
+    // Zeroing the published sequence prevents readers from accepting a slot
+    // while this thread is replacing it.
+    InterlockedExchange(&event.sequence, 0);
+    event.tick = GetTickCount();
+    event.thread_id = GetCurrentThreadId();
+    event.caller_rva = caller_rva_value;
+    event.size = size > 0xFFFFFFFFu ? 0xFFFFFFFFu : static_cast<DWORD>(size);
+    event.flags = flags;
+    event.result = result;
+    event.heap = heap;
+    MemoryBarrier();
+    InterlockedExchange(&event.sequence, sequence);
+}
+
 static CallsiteStat* callsite_for(DWORD rva) {
     // Zero means unused, so keep the out-of-image sentinel but shift a true
     // RVA zero to one (the game has no allocation call at its DOS header).
@@ -153,14 +252,14 @@ static CallsiteStat* callsite_for(DWORD rva) {
 static void record_alloc_site(DWORD rva, SIZE_T size, bool realloc_call) {
     CallsiteStat* site = callsite_for(rva);
     if (!site) return;
-    if (realloc_call) InterlockedIncrement(&site->realloc_calls);
-    else InterlockedIncrement(&site->alloc_calls);
+    if (realloc_call) InterlockedIncrement64(&site->realloc_calls);
+    else InterlockedIncrement64(&site->alloc_calls);
     InterlockedExchangeAdd64(&site->requested_bytes, static_cast<LONG64>(size));
 }
 
 static void record_free_site(DWORD rva) {
     CallsiteStat* site = callsite_for(rva);
-    if (site) InterlockedIncrement(&site->free_calls);
+    if (site) InterlockedIncrement64(&site->free_calls);
 }
 
 static void record_failure_site(DWORD rva) {
@@ -168,9 +267,10 @@ static void record_failure_site(DWORD rva) {
     if (site) InterlockedIncrement(&site->failures);
 }
 
-static bool insert_sample(void* pointer, SIZE_T size, DWORD alloc_rva) {
+static bool insert_sample(void* pointer, SIZE_T size, DWORD alloc_rva, HANDLE heap) {
     if (!should_sample(pointer)) return false;
-    const DWORD origin_rva = sampled_upstream_rva(alloc_rva);
+    const DWORD origin_rva = g_engine_context_active
+        ? alloc_rva : sampled_upstream_rva(alloc_rva);
     const DWORD hash = mix_pointer(pointer);
     // The low bits select the 1/SAMPLE_RATE cohort. Use different hash bits
     // for the table index or every sampled pointer clusters into a few slots.
@@ -180,6 +280,7 @@ static bool insert_sample(void* pointer, SIZE_T size, DWORD alloc_rva) {
     for (unsigned probe = 0; probe < SAMPLE_PROBES; ++probe) {
         SampleEntry& slot = g_samples[(start + probe) & (SAMPLE_CAPACITY - 1u)];
         if (!slot.pointer) {
+            slot.heap = heap;
             slot.size = size > 0xFFFFFFFFu ? 0xFFFFFFFFu : static_cast<DWORD>(size);
             slot.alloc_rva = origin_rva;
             slot.tick = GetTickCount();
@@ -202,6 +303,13 @@ static bool insert_sample(void* pointer, SIZE_T size, DWORD alloc_rva) {
         InterlockedExchangeAdd64(&site->sample_live_bytes,
                                  size > 0xFFFFFFFFu ? 0xFFFFFFFFu : static_cast<LONG64>(size));
     }
+    HeapStat* heap_stat = heap_stat_for(heap);
+    if (heap_stat) {
+        InterlockedIncrement64(&heap_stat->sample_alloc_count);
+        InterlockedIncrement(&heap_stat->sample_live_count);
+        InterlockedExchangeAdd64(&heap_stat->sample_live_bytes,
+                                 size > 0xFFFFFFFFu ? 0xFFFFFFFFu : static_cast<LONG64>(size));
+    }
     return true;
 }
 
@@ -217,6 +325,7 @@ static bool remove_sample(void* pointer, DWORD* size, DWORD* alloc_rva, DWORD* l
         if (slot.pointer == pointer) {
             found = slot;
             slot.pointer = nullptr;
+            slot.heap = nullptr;
             slot.size = 0;
             slot.alloc_rva = 0;
             slot.tick = 0;
@@ -241,6 +350,15 @@ static bool remove_sample(void* pointer, DWORD* size, DWORD* alloc_rva, DWORD* l
         InterlockedExchangeAdd64(&origin->sample_lifetime_ms,
                                  lifetime_ms ? *lifetime_ms : 0);
     }
+    HeapStat* heap_stat = heap_stat_for(found.heap);
+    if (heap_stat) {
+        InterlockedIncrement64(&heap_stat->sample_free_count);
+        InterlockedDecrement(&heap_stat->sample_live_count);
+        InterlockedExchangeAdd64(&heap_stat->sample_live_bytes,
+                                 -static_cast<LONG64>(found.size));
+        InterlockedExchangeAdd64(&heap_stat->sample_freed_bytes,
+                                 static_cast<LONG64>(found.size));
+    }
     return true;
 }
 
@@ -260,8 +378,10 @@ static void log_low_level_failure(const char* api, SIZE_T size, DWORD rva,
 }
 
 static LPVOID WINAPI profiled_heap_alloc(HANDLE heap, DWORD flags, SIZE_T size) {
-    const DWORD rva = caller_rva();
-    InterlockedIncrement(&g_heap_alloc_calls);
+    const DWORD direct_rva = caller_rva();
+    const DWORD rva = g_engine_context_active ? g_engine_context_rva : direct_rva;
+    if (g_engine_context_active) g_engine_context_heap = heap;
+    InterlockedIncrement64(&g_heap_alloc_calls);
     InterlockedExchangeAdd64(&g_heap_requested_bytes, static_cast<LONG64>(size));
     record_alloc_site(rva, size, false);
 
@@ -269,16 +389,21 @@ static LPVOID WINAPI profiled_heap_alloc(HANDLE heap, DWORD flags, SIZE_T size) 
     if (!result) {
         const bool released = memory_guard::release_after_failure();
         if (released) result = g_originalHeapAlloc(heap, flags, size);
+        record_flight_event(size, rva, result, heap,
+                            FLIGHT_FAILURE | (result ? FLIGHT_RECOVERED : 0u));
         log_low_level_failure("HeapAlloc", size, rva, released, result != nullptr);
+        log_flight_recorder();
     }
-    if (result) insert_sample(result, size, rva);
+    if (result) insert_sample(result, size, rva, heap);
     return result;
 }
 
 static LPVOID WINAPI profiled_heap_realloc(HANDLE heap, DWORD flags,
                                            LPVOID pointer, SIZE_T size) {
-    const DWORD rva = caller_rva();
-    InterlockedIncrement(&g_heap_realloc_calls);
+    const DWORD direct_rva = caller_rva();
+    const DWORD rva = g_engine_context_active ? g_engine_context_rva : direct_rva;
+    if (g_engine_context_active) g_engine_context_heap = heap;
+    InterlockedIncrement64(&g_heap_realloc_calls);
     InterlockedExchangeAdd64(&g_heap_requested_bytes, static_cast<LONG64>(size));
     record_alloc_site(rva, size, true);
 
@@ -286,18 +411,21 @@ static LPVOID WINAPI profiled_heap_realloc(HANDLE heap, DWORD flags,
     if (!result) {
         const bool released = memory_guard::release_after_failure();
         if (released) result = g_originalHeapReAlloc(heap, flags, pointer, size);
+        record_flight_event(size, rva, result, heap,
+                            FLIGHT_FAILURE | (result ? FLIGHT_RECOVERED : 0u));
         log_low_level_failure("HeapReAlloc", size, rva, released, result != nullptr);
+        log_flight_recorder();
     }
     if (result) {
         remove_sample(pointer, nullptr, nullptr, nullptr);
-        insert_sample(result, size, rva);
+        insert_sample(result, size, rva, heap);
     }
     return result;
 }
 
 static BOOL WINAPI profiled_heap_free(HANDLE heap, DWORD flags, LPVOID pointer) {
     const DWORD rva = caller_rva();
-    InterlockedIncrement(&g_heap_free_calls);
+    InterlockedIncrement64(&g_heap_free_calls);
     const DWORD sampled_free_rva = should_sample(pointer)
         ? sampled_upstream_rva(rva) : 0;
     const BOOL result = g_originalHeapFree(heap, flags, pointer);
@@ -311,7 +439,7 @@ static BOOL WINAPI profiled_heap_free(HANDLE heap, DWORD flags, LPVOID pointer) 
 static LPVOID WINAPI profiled_virtual_alloc(LPVOID address, SIZE_T size,
                                             DWORD allocation_type, DWORD protect) {
     const DWORD rva = caller_rva();
-    InterlockedIncrement(&g_virtual_alloc_calls);
+    InterlockedIncrement64(&g_virtual_alloc_calls);
     InterlockedExchangeAdd64(&g_virtual_requested_bytes, static_cast<LONG64>(size));
 
     LPVOID result = g_originalVirtualAlloc(address, size, allocation_type, protect);
@@ -321,6 +449,8 @@ static LPVOID WINAPI profiled_virtual_alloc(LPVOID address, SIZE_T size,
         if (released) result = g_originalVirtualAlloc(address, size, allocation_type, protect);
         InterlockedIncrement(&g_virtual_failures);
         record_failure_site(rva);
+        record_flight_event(size, rva, result, nullptr,
+                            FLIGHT_FAILURE | (result ? FLIGHT_RECOVERED : 0u));
         logger::log(
             "LOW-LEVEL VIRTUAL FAILURE%s : VirtualAlloc size=%zu type=0x%08lX caller=mowas_2.exe+0x%08lX error=%lu reserve_released=%s",
             result ? " RECOVERED" : "",
@@ -330,6 +460,7 @@ static LPVOID WINAPI profiled_virtual_alloc(LPVOID address, SIZE_T size,
             static_cast<unsigned long>(original_error),
             released ? "yes" : "no");
         log_summary(true);
+        log_flight_recorder();
         logger::flush_now();
         if (!result) SetLastError(original_error);
     }
@@ -337,7 +468,7 @@ static LPVOID WINAPI profiled_virtual_alloc(LPVOID address, SIZE_T size,
 }
 
 static BOOL WINAPI profiled_virtual_free(LPVOID address, SIZE_T size, DWORD free_type) {
-    InterlockedIncrement(&g_virtual_free_calls);
+    InterlockedIncrement64(&g_virtual_free_calls);
     return g_originalVirtualFree(address, size, free_type);
 }
 
@@ -421,15 +552,15 @@ static bool find_iat_slots(std::uintptr_t base, IatPatch* patches, unsigned coun
 
 struct RankedSite {
     DWORD rva;
-    LONG calls;
-    LONG frees;
+    LONG64 calls;
+    LONG64 frees;
     LONG sample_live_count;
     LONG64 requested;
     LONG64 sample_live;
     LONG64 sample_freed;
     LONG64 sample_lifetime;
     LONG sample_free_count;
-    LONG engine_sample_calls;
+    LONG64 engine_sample_calls;
     LONG64 engine_sample_bytes;
 };
 
@@ -480,12 +611,72 @@ void record_engine_request(std::size_t size, std::uintptr_t caller) {
     if (!g_installed) return;
     if ((++g_engine_sample_counter & (ENGINE_SAMPLE_RATE - 1u)) != 0) return;
 
-    const DWORD rva = caller >= g_base && caller < g_base + TARGET_IMAGE_SIZE
-        ? static_cast<DWORD>(caller - g_base) : 0xFFFFFFFFu;
+    const DWORD rva = to_game_rva(caller);
     CallsiteStat* site = callsite_for(rva);
     if (!site) return;
-    InterlockedIncrement(&site->engine_sample_calls);
+    InterlockedIncrement64(&site->engine_sample_calls);
     InterlockedExchangeAdd64(&site->engine_sample_bytes, static_cast<LONG64>(size));
+}
+
+void begin_engine_request(std::size_t size, std::uintptr_t caller) {
+    g_engine_context_active = true;
+    g_engine_context_rva = to_game_rva(caller);
+    g_engine_context_size = size;
+    g_engine_context_heap = nullptr;
+    record_engine_request(size, caller);
+}
+
+void end_engine_request(void* result, bool initial_failure, bool recovered) {
+    if (!g_engine_context_active) return;
+
+    DWORD flags = 0;
+    if (g_engine_context_size >= LARGE_FLIGHT_BYTES) flags |= FLIGHT_LARGE;
+    if (memory_guard::is_under_pressure() &&
+        ((++g_pressure_flight_counter & (PRESSURE_FLIGHT_RATE - 1u)) == 0)) {
+        flags |= FLIGHT_PRESSURE;
+    }
+    if (initial_failure || !result) flags |= FLIGHT_FAILURE;
+    if (recovered) flags |= FLIGHT_RECOVERED;
+    if (flags != 0) {
+        record_flight_event(g_engine_context_size, g_engine_context_rva,
+                            result, g_engine_context_heap, flags);
+    }
+
+    g_engine_context_active = false;
+    g_engine_context_rva = 0xFFFFFFFFu;
+    g_engine_context_size = 0;
+    g_engine_context_heap = nullptr;
+}
+
+void log_flight_recorder() {
+    const LONG newest = InterlockedCompareExchange(&g_flight_sequence, 0, 0);
+    if (newest <= 0) return;
+
+    constexpr LONG MAX_LOGGED = 16;
+    const LONG first = newest > MAX_LOGGED ? newest - MAX_LOGGED + 1 : 1;
+    logger::log("ALLOC FLIGHT : newest_sequence=%ld showing=%ld..%ld",
+                static_cast<long>(newest), static_cast<long>(first),
+                static_cast<long>(newest));
+    for (LONG sequence = first; sequence <= newest; ++sequence) {
+        FlightEvent& event = g_flight[
+            (static_cast<unsigned>(sequence) - 1u) & (FLIGHT_CAPACITY - 1u)];
+        if (InterlockedCompareExchange(&event.sequence, 0, 0) != sequence) continue;
+        const DWORD tick = event.tick;
+        const DWORD thread_id = event.thread_id;
+        const DWORD caller = event.caller_rva;
+        const DWORD size = event.size;
+        const DWORD flags = event.flags;
+        void* result = event.result;
+        HANDLE heap = event.heap;
+        MemoryBarrier();
+        if (InterlockedCompareExchange(&event.sequence, 0, 0) != sequence) continue;
+        logger::log(
+            "ALLOC FLIGHT #%ld : tick=%lu thread=%lu caller=mowas_2.exe+0x%08lX size=%lu result=%p heap=%p flags=0x%02lX",
+            static_cast<long>(sequence), static_cast<unsigned long>(tick),
+            static_cast<unsigned long>(thread_id), static_cast<unsigned long>(caller),
+            static_cast<unsigned long>(size), result, heap,
+            static_cast<unsigned long>(flags));
+    }
 }
 
 void log_summary(bool detailed) {
@@ -497,14 +688,14 @@ void log_summary(bool detailed) {
         ? static_cast<unsigned long long>(sampled_live) * SAMPLE_RATE : 0ull;
 
     logger::log(
-        "ALLOC PROFILE : heap alloc=%ld realloc=%ld free=%ld failures=%ld requested=%llu MiB | virtual alloc=%ld free=%ld failures=%ld requested=%llu MiB | samples=%ld live=%llu KiB estimate=%llu MiB drops=%ld sites_dropped=%ld",
-        static_cast<long>(g_heap_alloc_calls),
-        static_cast<long>(g_heap_realloc_calls),
-        static_cast<long>(g_heap_free_calls),
+        "ALLOC PROFILE : heap alloc=%lld realloc=%lld free=%lld failures=%ld requested=%llu MiB | virtual alloc=%lld free=%lld failures=%ld requested=%llu MiB | samples=%ld live=%llu KiB estimate=%llu MiB drops=%ld sites_dropped=%ld",
+        static_cast<long long>(load64(&g_heap_alloc_calls)),
+        static_cast<long long>(load64(&g_heap_realloc_calls)),
+        static_cast<long long>(load64(&g_heap_free_calls)),
         static_cast<long>(g_heap_failures),
         static_cast<unsigned long long>(load64(&g_heap_requested_bytes)) / MiB,
-        static_cast<long>(g_virtual_alloc_calls),
-        static_cast<long>(g_virtual_free_calls),
+        static_cast<long long>(load64(&g_virtual_alloc_calls)),
+        static_cast<long long>(load64(&g_virtual_free_calls)),
         static_cast<long>(g_virtual_failures),
         static_cast<unsigned long long>(load64(&g_virtual_requested_bytes)) / MiB,
         static_cast<long>(g_sample_entries),
@@ -525,15 +716,15 @@ void log_summary(bool detailed) {
         if (!key) continue;
         RankedSite candidate = {};
         candidate.rva = static_cast<DWORD>(key);
-        candidate.calls = site.alloc_calls + site.realloc_calls;
-        candidate.frees = site.free_calls;
+        candidate.calls = load64(&site.alloc_calls) + load64(&site.realloc_calls);
+        candidate.frees = load64(&site.free_calls);
         candidate.sample_live_count = site.sample_live_count;
         candidate.requested = load64(&site.requested_bytes);
         candidate.sample_live = load64(&site.sample_live_bytes);
         candidate.sample_freed = load64(&site.sample_freed_bytes);
         candidate.sample_lifetime = load64(&site.sample_lifetime_ms);
         candidate.sample_free_count = site.sample_free_count;
-        candidate.engine_sample_calls = site.engine_sample_calls;
+        candidate.engine_sample_calls = load64(&site.engine_sample_calls);
         candidate.engine_sample_bytes = load64(&site.engine_sample_bytes);
         insert_top(top_requested, TOP_COUNT, candidate, RANK_REQUESTED);
         insert_top(top_live, TOP_COUNT, candidate, RANK_LIVE);
@@ -544,10 +735,10 @@ void log_summary(bool detailed) {
     for (unsigned i = 0; i < TOP_COUNT && top_requested[i].requested > 0; ++i) {
         const RankedSite& site = top_requested[i];
         logger::log(
-            "ALLOC TOP REQUEST #%u : mowas_2.exe+0x%08lX calls=%ld requested=%llu MiB sample_live=%llu KiB",
+            "ALLOC TOP REQUEST #%u : mowas_2.exe+0x%08lX calls=%lld requested=%llu MiB sample_live=%llu KiB",
             i + 1,
             static_cast<unsigned long>(site.rva),
-            static_cast<long>(site.calls),
+            static_cast<long long>(site.calls),
             static_cast<unsigned long long>(site.requested) / MiB,
             static_cast<unsigned long long>(site.sample_live) / 1024ull);
     }
@@ -570,23 +761,38 @@ void log_summary(bool detailed) {
     for (unsigned i = 0; i < TOP_COUNT && top_frees[i].frees > 0; ++i) {
         const RankedSite& site = top_frees[i];
         logger::log(
-            "ALLOC SAMPLED FREE #%u : mowas_2.exe+0x%08lX samples=%ld estimated_calls=%llu",
+            "ALLOC SAMPLED FREE #%u : mowas_2.exe+0x%08lX samples=%lld estimated_calls=%llu",
             i + 1,
             static_cast<unsigned long>(site.rva),
-            static_cast<long>(site.frees),
+            static_cast<long long>(site.frees),
             static_cast<unsigned long long>(site.frees) * SAMPLE_RATE);
     }
     for (unsigned i = 0; i < TOP_COUNT && top_engine[i].engine_sample_calls > 0; ++i) {
         const RankedSite& site = top_engine[i];
         logger::log(
-            "ENGINE ALLOC SAMPLE #%u : mowas_2.exe+0x%08lX samples=%ld sampled=%llu MiB estimated_calls=%llu estimated_requested=%llu MiB",
+            "ENGINE ALLOC SAMPLE #%u : mowas_2.exe+0x%08lX samples=%lld sampled=%llu MiB estimated_calls=%llu estimated_requested=%llu MiB",
             i + 1,
             static_cast<unsigned long>(site.rva),
-            static_cast<long>(site.engine_sample_calls),
+            static_cast<long long>(site.engine_sample_calls),
             static_cast<unsigned long long>(site.engine_sample_bytes) / MiB,
             static_cast<unsigned long long>(site.engine_sample_calls) * ENGINE_SAMPLE_RATE,
             static_cast<unsigned long long>(site.engine_sample_bytes) * ENGINE_SAMPLE_RATE / MiB);
     }
+
+    for (unsigned i = 0; i < HEAP_CAPACITY; ++i) {
+        HeapStat& heap = g_heaps[i];
+        void* handle = heap.handle;
+        if (!handle) continue;
+        logger::log(
+            "ALLOC HEAP #%u : handle=%p compatibility=%ld sampled_alloc=%lld sampled_free=%lld live_blocks=%ld live=%llu KiB freed=%llu KiB",
+            i + 1, handle, static_cast<long>(heap.compatibility),
+            static_cast<long long>(load64(&heap.sample_alloc_count)),
+            static_cast<long long>(load64(&heap.sample_free_count)),
+            static_cast<long>(heap.sample_live_count),
+            static_cast<unsigned long long>(load64(&heap.sample_live_bytes)) / 1024ull,
+            static_cast<unsigned long long>(load64(&heap.sample_freed_bytes)) / 1024ull);
+    }
+    log_flight_recorder();
 }
 
 bool install(std::uintptr_t game_base) {

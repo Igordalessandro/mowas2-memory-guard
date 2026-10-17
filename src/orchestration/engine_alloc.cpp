@@ -49,16 +49,26 @@ static void* guarded_allocate(PFN_EngineAlloc original, size_t size, const char*
     HookDepthScope depth;
     if (depth.outermost) {
         size = apply_known_lobby_workaround(size, hookName);
-        allocator_profiler::record_engine_request(size, caller);
+        allocator_profiler::begin_engine_request(size, caller);
         memory_guard::record_request(size);
         memory_guard::before_allocation(size);
     }
 
     void* result = original(size);
+    bool allocation_failed = false;
+    bool reserve_released = false;
     if (depth.outermost && !result) {
-        const bool released = memory_guard::release_after_failure();
-        if (released) result = original(size);
-        memory_guard::record_failure(size, hookName, released, result != nullptr);
+        allocation_failed = true;
+        reserve_released = memory_guard::release_after_failure();
+        if (reserve_released) result = original(size);
+    }
+    if (depth.outermost) {
+        allocator_profiler::end_engine_request(
+            result, allocation_failed, allocation_failed && result != nullptr);
+    }
+    if (allocation_failed) {
+        memory_guard::record_failure(size, hookName, reserve_released, result != nullptr);
+        allocator_profiler::log_flight_recorder();
     }
     return result;
 }

@@ -3,6 +3,8 @@
 // Target binary: mowas_2.exe v3.262.1 (Steam Oct 2019).
 #define MOWAS2_PREFERRED_BASE       0x00400000
 
+#define MEMORY_GUARD_VERSION        "2.5.0-experimental.1"
+
 #define OFFSET_ENGINE_ALLOC         0x00809041
 #define OFFSET_ENGINE_ALLOC_CORE    0x0010E4F0
 
@@ -12,18 +14,26 @@
 #define KNOWN_BAD_LOBBY_ALLOCATION  ((size_t)2147483552u) // 0x7fffffa0
 #define LOBBY_ALLOCATION_REPLACEMENT ((size_t)(4u * 1024u * 1024u))
 
-// Two reserved (not committed) virtual-address ranges are released in stages.
-// The primary block provides ordinary low-memory headroom.  The final block
-// stays unavailable until an allocator actually fails, avoiding the old
-// behavior where the whole reserve disappeared long before the final crash.
-#define PRIMARY_RESERVE_MB           48u
+// Three reserved (not committed) virtual-address ranges are released in
+// stages.  The final block remains unavailable until an allocator actually
+// fails.  The primary block can be re-armed after a sustained recovery.
+#define PRIMARY_RESERVE_MB           32u
+#define CRITICAL_RESERVE_MB          16u
 #define FINAL_RESERVE_MB             16u
 #define RELEASE_TOTAL_FREE_MB       192u
 #define RELEASE_LARGEST_FREE_MB      24u
+#define CRITICAL_TOTAL_FREE_MB        96u
+#define CRITICAL_LARGEST_FREE_MB       8u
+#define REARM_TOTAL_FREE_MB          768u
+#define REARM_LARGEST_FREE_MB        256u
+#define REARM_STABLE_MS            60000u
 #define TELEMETRY_INTERVAL_MS     30000u
 #define MONITOR_INTERVAL_MS        5000u
+#define CRITICAL_MONITOR_INTERVAL_MS 1000u
 
 // Logging
 #define ENABLE_LOGGING              1
 #define LOG_FILE_NAME               L"mowas2-memory-guard.log"
-#define LOG_FILE_PER_RUN            0
+#define LOG_FILE_STEM               L"mowas2-memory-guard"
+#define LOG_FILE_PER_RUN            1
+#define LOG_FILE_RETAINED_RUNS      10u

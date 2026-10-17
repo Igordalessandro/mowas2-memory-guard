@@ -1,5 +1,10 @@
 # Men of War: Assault Squad 2 Memory Guard
 
+> [!IMPORTANT]
+> The `experimental/allocator-diagnostics-v2.5` branch is not the public stable
+> release. Its DLL identifies itself as `2.5.0-experimental.1`. Use the v2.4.2
+> GitHub release for the stable rollback build.
+
 An experimental 32-bit proxy DLL for the Steam edition of *Men of War: Assault
 Squad 2*. It mitigates the known 2 GB lobby-allocation crash, keeps emergency
 virtual address space available for allocation recovery, preserves crash dumps,
@@ -39,7 +44,7 @@ modified, or repacked `mowas_2.exe`.
    `C:\Program Files (x86)\Steam\steamapps\common\Men of War Assault Squad 2`.
 4. Put `dbghelp.dll` beside `mowas_2.exe`.
 5. Start the game through Steam.
-6. Confirm that `mowas2-memory-guard.log` appears in the game directory and
+6. Confirm that a timestamped `mowas2-memory-guard-*.log` appears in the game directory and
    reports that the allocator and VAC guards installed successfully.
 
 ### Linux / Steam Proton
@@ -54,7 +59,7 @@ modified, or repacked `mowas_2.exe`.
    PROTON_USE_WOW64=1 WINEDLLOVERRIDES="dbghelp=n,b" %command%
    ```
 
-5. Launch the game and confirm that `mowas2-memory-guard.log` appears in the
+5. Launch the game and confirm that a timestamped `mowas2-memory-guard-*.log` appears in the
    game directory.
 
 `PROTON_USE_WOW64=1` selects Proton's newer WoW64 execution path when the
@@ -83,22 +88,27 @@ does not modify saves or permanently patch `mowas_2.exe`.
 - Hooks both known engine allocation entry points.
 - Replaces only the observed corrupt `2,147,483,552`-byte lobby request with a
   4 MiB request. It does not broadly shrink every large allocation.
-- Holds 64 MiB of uncommitted emergency virtual address space in two stages:
-  a 48 MiB primary reserve and a 16 MiB final reserve, with smaller fallbacks.
+- Holds 64 MiB of uncommitted emergency virtual address space in three stages:
+  a 32 MiB primary reserve, a 16 MiB critical reserve, and a 16 MiB final
+  reserve, with smaller fallbacks.
 - Releases the primary reserve when total free address space, the largest
   contiguous block, or an upcoming large request indicates exhaustion is near.
-  The final reserve remains unavailable to the game until an allocation
-  actually fails, so it is not consumed during a long low-memory plateau.
+  The critical reserve has a lower threshold, while the final reserve remains
+  unavailable until an allocation actually fails. The primary reserve can be
+  re-armed after address space remains healthy for a full minute.
 - Hooks the executable's `HeapAlloc`, `HeapReAlloc`, `HeapFree`,
   `VirtualAlloc`, and `VirtualFree` imports without replacing their allocator
   semantics. On an allocation failure it releases remaining reserves and
   retries the same request once.
-- Records allocation counts, the largest request, committed/reserved memory,
+- Records 64-bit allocation counts, the largest request, committed/reserved memory,
   total free address space, and the largest free region every 30 seconds.
 - Samples allocation lifetimes and engine request call sites using fixed-size,
   preallocated tables. Every two minutes the log lists the largest request,
   retained-allocation, free, and engine-request sites as executable-relative
   addresses suitable for later reverse engineering.
+- Carries the higher-level engine caller into retained-allocation samples,
+  records sampled heap identity and heap compatibility mode, and retains a
+  fixed 256-entry allocation flight recorder for large and low-memory requests.
 - Validates both hook-site signatures and rolls back partial hook installation
   instead of patching an unknown executable.
 - Forwards `ImageNtHeader` and `MiniDumpWriteDump` to the real system
@@ -157,12 +167,13 @@ and source that made this continuation possible.
 
 ## Files the DLL creates
 
-A `mowas2-memory-guard.log` file is written next to `dbghelp.dll` in the game
-folder. It contains hook validation, periodic address-space and allocator
-telemetry, sampled call-site rankings, emergency-reserve events, and
-lobby-workaround events. It is truncated at each launch and safe to delete. A
-copy of the real Windows `dbghelp.dll` is also placed in `%TEMP%` so the proxy
-can forward both `ImageNtHeader` and `MiniDumpWriteDump`.
+Timestamped `mowas2-memory-guard-*.log` files are written next to `dbghelp.dll`
+in the game folder. They contain hook validation, periodic address-space and
+allocator telemetry, sampled call-site rankings, heap statistics, flight
+recorder entries, emergency-reserve events, and lobby-workaround events. The
+newest ten sessions are retained. A copy of the real Windows `dbghelp.dll` is
+also placed in `%TEMP%` so the proxy can forward both `ImageNtHeader` and
+`MiniDumpWriteDump`.
 
 ## License
 
