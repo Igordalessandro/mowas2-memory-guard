@@ -102,6 +102,9 @@ does not modify saves or permanently patch `mowas_2.exe`.
   retries the same request once.
 - Records 64-bit allocation counts, the largest request, committed/reserved memory,
   total free address space, and the largest free region every 30 seconds.
+  "64-bit" here describes the diagnostic integer width only: the DLL remains
+  PE32/x86, uses 32-bit pointers, and does not require an x64 process. Native
+  32-bit Windows has not yet been verified with the experimental build.
 - Samples allocation lifetimes and engine request call sites using fixed-size,
   preallocated tables. Every two minutes the log lists the largest request,
   retained-allocation, free, and engine-request sites as executable-relative
@@ -249,6 +252,9 @@ This project would not have existed without the following ecosystem of tools, li
 ### Build / target
 
 - **Windows 10/11**, 32-bit DLL target.
+- **Architecture:** PE32/x86. It must be loaded by the game's 32-bit process;
+  its 64-bit diagnostic counters do not make it a 64-bit DLL or expand the
+  game's virtual address space.
 - **Visual Studio 2022 Build Tools** : `cl.exe` / `link.exe` x86, vcvarsall, MSVC 19.x.
 - **`dbghelp.dll` proxy pattern** : chosen over the more common `iphlpapi.dll` because SteamStub V3 blacklists `iphlpapi.dll` as a proxy target. `dbghelp.dll` passes the integrity check.
 

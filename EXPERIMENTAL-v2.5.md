@@ -19,6 +19,28 @@ The flight recorder, heap table, call-site table, and sample table are all
 fixed-size static storage. They do not allocate memory while the game is under
 pressure.
 
+## Architecture compatibility
+
+This experiment is still a **32-bit x86 DLL** for the 32-bit
+`mowas_2.exe`. The phrase "64-bit diagnostic counters" describes only the
+width of a few integer values used to count allocator activity. Those counters
+use aligned x86 atomic operations; they do not introduce 64-bit pointers,
+increase the game's address space, or turn the DLL into an x64 binary.
+
+Consequently, the counter change does not by itself require a 64-bit operating
+system. The DLL continues to run as 32-bit code on Windows and under WoW64 or
+Proton WoW64. Native 32-bit Windows has not yet been tested with this
+experimental build, so it should not be advertised as verified there until a
+real-machine test is completed.
+
+Digitalmindsoft's developer-marked explanation for not shipping a separate
+64-bit AS2 executable was multiplayer community separation: its 32-bit and
+64-bit clients would not have been compatible with one another. That concern
+does not apply to these counters because this project does not create a
+separate 64-bit game or protocol:
+
+<https://steamcommunity.com/app/244450/discussions/0/1743356517529247789/#c1743356517529377814>
+
 ## VAC invariants
 
 Every experimental DLL must preserve all of these properties:
