@@ -3,6 +3,7 @@
 #include <windows.h>
 
 #include "shared/logging/logger.h"
+#include "diagnostics/crash_report.h"
 #include "orchestration/hooks.h"
 #include "orchestration/memory_guard.h"
 #include "safety/vac_host_guard.h"
@@ -15,11 +16,13 @@ static DWORD WINAPI delayed_init_thread(LPVOID) {
         OutputDebugStringA("mowas2-perf: logger::init() failed, continuing without log\n");
     }
     logger::log("delayed_init thread starting");
+    crash_report::install();
 
     // Install the host-safety boundary before the delayed allocator hooks.  If
     // it cannot be installed, stop the process before a secured host can be
     // created with this custom DLL loaded.
     if (!vac_host_guard::install()) {
+        logger::report_event("event=startup_failure component=vac_host_guard action=process_closed");
         logger::log("delayed_init: VAC host guard FAILED; exiting fail-closed");
         logger::flush_now();
         MessageBoxW(
@@ -43,6 +46,7 @@ static DWORD WINAPI delayed_init_thread(LPVOID) {
                 HOOK_INSTALL_DELAY_MS);
 
     if (!vac_join_guard::install()) {
+        logger::report_event("event=startup_failure component=vac_join_guard action=process_closed");
         logger::log("delayed_init: VAC join guard FAILED; exiting fail-closed");
         logger::flush_now();
         MessageBoxW(
@@ -57,8 +61,10 @@ static DWORD WINAPI delayed_init_thread(LPVOID) {
     }
 
     if (!hooks::install()) {
+        logger::report_event("event=startup_failure component=allocator_hooks telemetry=active");
         logger::log("delayed_init: hooks::install FAILED - telemetry remains active but allocator interception is disabled");
     } else {
+        logger::report_event("event=startup_ok vac_host=ok vac_join=ok allocator_hooks=ok");
         logger::log("delayed_init: hooks installed successfully");
     }
 

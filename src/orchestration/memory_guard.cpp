@@ -164,6 +164,18 @@ static void log_snapshot(const AddressSpaceSnapshot& snapshot, bool low) {
         largest / 1024,
         have_process ? static_cast<unsigned long long>(pmc.PrivateUsage) / MiB : 0ull,
         have_process ? static_cast<unsigned long long>(pmc.WorkingSetSize) / MiB : 0ull);
+    logger::report_memory(
+        "mem free=%lluMiB largest=%luMiB commit=%lluMiB reserve=%lluMiB guard=%luMiB private=%lluMiB ws=%lluMiB req=%lld cum=%lluMiB max=%ldKiB",
+        snapshot.free_bytes / MiB,
+        static_cast<unsigned long>(snapshot.largest_free / MiB),
+        snapshot.committed_bytes / MiB,
+        snapshot.reserved_bytes / MiB,
+        reserve_mib,
+        have_process ? static_cast<unsigned long long>(pmc.PrivateUsage) / MiB : 0ull,
+        have_process ? static_cast<unsigned long long>(pmc.WorkingSetSize) / MiB : 0ull,
+        static_cast<long long>(count),
+        static_cast<unsigned long long>(requested) / MiB,
+        largest / 1024);
 }
 
 static DWORD WINAPI monitor_thread(LPVOID) {
@@ -178,6 +190,9 @@ static DWORD WINAPI monitor_thread(LPVOID) {
                          snapshot.largest_free < static_cast<SIZE_T>(RELEASE_LARGEST_FREE_MB) * MiB;
         const bool critical = snapshot.free_bytes < static_cast<unsigned long long>(CRITICAL_TOTAL_FREE_MB) * MiB ||
                               snapshot.largest_free < static_cast<SIZE_T>(CRITICAL_LARGEST_FREE_MB) * MiB;
+        const bool emergency =
+            snapshot.free_bytes < static_cast<unsigned long long>(FINAL_TOTAL_FREE_MB) * MiB ||
+            snapshot.largest_free < static_cast<SIZE_T>(FINAL_LARGEST_FREE_MB) * MiB;
         const bool diagnostic_pressure =
             snapshot.free_bytes < 256ull * MiB || snapshot.largest_free < 64u * MiB;
         InterlockedExchange(&g_underPressure, diagnostic_pressure ? 1 : 0);
@@ -185,6 +200,7 @@ static DWORD WINAPI monitor_thread(LPVOID) {
 
         if (low) release_primary(RELEASE_LOW_ADDRESS_SPACE);
         if (critical) release_critical(RELEASE_LOW_ADDRESS_SPACE);
+        if (emergency) release_final(RELEASE_LOW_ADDRESS_SPACE);
 
         const DWORD now = GetTickCount();
         const bool recovered = !g_primaryReserve && g_criticalReserve && g_finalReserve &&
@@ -220,6 +236,8 @@ static DWORD WINAPI monitor_thread(LPVOID) {
                                     "allocation failure";
                 logger::log("MEM GUARD RELEASED : primary %lu MiB VA reserve (%s)",
                             static_cast<unsigned long>(g_primaryReserveSize / MiB), label);
+                logger::report_event("event=reserve_release stage=primary size=%luMiB reason=%s",
+                                     static_cast<unsigned long>(g_primaryReserveSize / MiB), label);
             }
             if (events & EVENT_CRITICAL) {
                 const LONG reason = InterlockedExchange(&g_criticalReleaseReason, RELEASE_NONE);
@@ -228,13 +246,21 @@ static DWORD WINAPI monitor_thread(LPVOID) {
                                     "allocation failure";
                 logger::log("MEM GUARD RELEASED : critical %lu MiB VA reserve (%s)",
                             static_cast<unsigned long>(g_criticalReserveSize / MiB), label);
+                logger::report_event("event=reserve_release stage=critical size=%luMiB reason=%s",
+                                     static_cast<unsigned long>(g_criticalReserveSize / MiB), label);
             }
             if (events & EVENT_FINAL) {
                 const LONG reason = InterlockedExchange(&g_finalReleaseReason, RELEASE_NONE);
-                const char* label = reason == RELEASE_ALLOCATION_FAILURE
+                const char* label = reason == RELEASE_LOW_ADDRESS_SPACE
+                    ? "emergency address space" :
+                    reason == RELEASE_LARGE_REQUEST
+                    ? "large allocation request" :
+                    reason == RELEASE_ALLOCATION_FAILURE
                     ? "allocation failure" : "explicit recovery request";
                 logger::log("MEM GUARD RELEASED : final %lu MiB VA reserve (%s)",
                             static_cast<unsigned long>(g_finalReserveSize / MiB), label);
+                logger::report_event("event=reserve_release stage=final size=%luMiB reason=%s",
+                                     static_cast<unsigned long>(g_finalReserveSize / MiB), label);
             }
             if (events & EVENT_PRIMARY_REARMED) {
                 logger::log("MEM GUARD REARMED : primary %lu MiB VA reserve after sustained recovery",
@@ -307,14 +333,35 @@ bool install() {
 
 void before_allocation(std::size_t size) {
     if (size < 8u * 1024u * 1024u) return;
-    AddressSpaceSnapshot snapshot = scan_address_space();
+
     const unsigned long long margin = 16ull * MiB;
-    if (snapshot.free_bytes < static_cast<unsigned long long>(size) + margin ||
-        snapshot.largest_free < static_cast<SIZE_T>(size) + static_cast<SIZE_T>(margin)) {
-        if (!release_primary(RELEASE_LARGE_REQUEST)) {
-            release_critical(RELEASE_LARGE_REQUEST);
-        }
+    const unsigned long long needed_total = static_cast<unsigned long long>(size) + margin;
+    const SIZE_T max_size = static_cast<SIZE_T>(-1);
+    const SIZE_T needed_largest = size > max_size - static_cast<SIZE_T>(margin)
+        ? max_size
+        : static_cast<SIZE_T>(size) + static_cast<SIZE_T>(margin);
+
+    auto has_headroom = [needed_total, needed_largest](const AddressSpaceSnapshot& snapshot) {
+        return snapshot.free_bytes >= needed_total &&
+               snapshot.largest_free >= needed_largest;
+    };
+
+    AddressSpaceSnapshot snapshot = scan_address_space();
+    if (has_headroom(snapshot)) return;
+
+    // The reserve blocks are allocated next to one another at startup. Release
+    // and re-scan one stage at a time so a large mod allocation can recover a
+    // sufficiently large contiguous region before the engine aborts. The
+    // final 48 MiB stage is used only when the smaller stages are insufficient.
+    if (release_primary(RELEASE_LARGE_REQUEST)) {
+        snapshot = scan_address_space();
+        if (has_headroom(snapshot)) return;
     }
+    if (release_critical(RELEASE_LARGE_REQUEST)) {
+        snapshot = scan_address_space();
+        if (has_headroom(snapshot)) return;
+    }
+    release_final(RELEASE_LARGE_REQUEST);
 }
 
 bool release_after_failure() {
@@ -347,6 +394,10 @@ void record_failure(std::size_t size, const char* hook_name,
                 retry_succeeded ? " RECOVERED" : "",
                 hook_name ? hook_name : "unknown", size,
                 reserve_released ? "yes" : "no");
+    logger::report_event("event=alloc_failure hook=%s bytes=%zu reserve_released=%s retry=%s",
+                         hook_name ? hook_name : "unknown", size,
+                         reserve_released ? "yes" : "no",
+                         retry_succeeded ? "succeeded" : "failed");
     logger::flush_now();
 }
 

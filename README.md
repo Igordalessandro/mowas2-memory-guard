@@ -2,7 +2,7 @@
 
 > [!IMPORTANT]
 > The `experimental/allocator-diagnostics-v2.5` branch is not the public stable
-> release. Its DLL identifies itself as `2.5.0-experimental.1`. Use the v2.4.2
+> release. Its DLL identifies itself as `2.5.0-experimental.4`. Use the v2.4.2
 > GitHub release for the stable rollback build.
 
 An experimental 32-bit proxy DLL for the Steam edition of *Men of War: Assault
@@ -89,13 +89,16 @@ does not modify saves or permanently patch `mowas_2.exe`.
 - Replaces only the observed corrupt `2,147,483,552`-byte lobby request with a
   4 MiB request. It does not broadly shrink every large allocation.
 - Holds 64 MiB of uncommitted emergency virtual address space in three stages:
-  a 32 MiB primary reserve, a 16 MiB critical reserve, and a 16 MiB final
-  reserve, with smaller fallbacks.
+  an 8 MiB primary reserve, an 8 MiB critical reserve, and a contiguous 48 MiB
+  final reserve suitable for the large requests observed while loading heavy
+  mods such as RobZ.
 - Releases the primary reserve when total free address space, the largest
   contiguous block, or an upcoming large request indicates exhaustion is near.
-  The critical reserve has a lower threshold, while the final reserve remains
-  unavailable until an allocation actually fails. The primary reserve can be
-  re-armed after address space remains healthy for a full minute.
+  The critical reserve has a lower threshold. Large requests release and
+  re-scan stages until enough contiguous headroom exists; the final reserve is
+  also released proactively under emergency fragmentation or after an observed
+  failure. The primary reserve can be re-armed after address space remains
+  healthy for a full minute.
 - Hooks the executable's `HeapAlloc`, `HeapReAlloc`, `HeapFree`,
   `VirtualAlloc`, and `VirtualFree` imports without replacing their allocator
   semantics. On an allocation failure it releases remaining reserves and
@@ -132,10 +135,11 @@ must uncheck **VAC Secured** and try hosting again.
 
 Before a secure game-server session can authenticate, the DLL rejects any
 SteamUser018 `InitiateGameConnection` request whose `bSecure` flag is true.
-The guard replaces only that interface's dispatch entry and does not patch or
-query SteamMatchmaking. Earlier experimental builds intercepted `JoinLobby`,
-but that was removed because touching the matchmaking interface could
-destabilize friend and persona names under Proton's WoW64 bridge.
+The guard detours that method's implementation without modifying Proton's
+SteamUser vtable, and does not patch or query SteamMatchmaking. Earlier
+experimental builds modified Steam interface dispatch tables, but that was
+removed because it could destabilize friend and persona names under Proton's
+WoW64 bridge.
 
 These are fail-closed refusal mechanisms. They do not disable VAC, forge VAC
 state, make a secure server insecure, or provide immunity from enforcement. If
@@ -177,6 +181,21 @@ recorder entries, emergency-reserve events, and lobby-workaround events. The
 newest ten sessions are retained. A copy of the real Windows `dbghelp.dll` is
 also placed in `%TEMP%` so the proxy can forward both `ImageNtHeader` and
 `MiniDumpWriteDump`.
+
+The same folder contains **`DLL Crash Report.txt`**. It is overwritten for
+each run and continuously refreshed with the version, platform, guard status,
+latest memory snapshot, allocator totals, hottest sampled call sites, last
+recovery event, and any captured unhandled exception. It contains ASCII only
+and has a hard 900-byte ceiling so the entire file fits in Steam's roughly
+1,000-character comment limit. A report remains useful after a silent crash,
+but it can also describe a healthy or still-running session.
+
+When reporting a problem, paste the entire contents of `DLL Crash Report.txt`
+and separately state the active mods, last in-game action, and whether the game
+showed a dialog or silently returned to the desktop. The compact report avoids
+command lines, usernames, full installation paths, server IP addresses, and
+Steam IDs. If maintainers request deeper evidence, attach the matching full
+timestamped log to a GitHub issue instead of trying to paste it into Steam.
 
 ## License
 

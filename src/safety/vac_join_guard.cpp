@@ -4,14 +4,15 @@
 
 #include <windows.h>
 #include <cstdint>
+#include "MinHook.h"
 
 namespace vac_join_guard {
 namespace {
 
 // SteamUser018 provides a late boundary before the game obtains the
-// authentication blob used by a secure game server.  Do not hook or query
-// SteamMatchmaking here: even an interface-local JoinLobby substitution was
-// observed to destabilize friend/persona names under Proton's WoW64 bridge.
+// authentication blob used by a secure game server. Do not modify a
+// Proton-owned interface vtable here: that destabilized persona names and was
+// implicated in a Steam IPC-thread crash under Proton's WoW64 bridge.
 using SteamUserAccessorFn = void* (__cdecl *)();
 using InitiateGameConnectionFn = int (__thiscall *)(
     void* self,
@@ -24,7 +25,6 @@ using InitiateGameConnectionFn = int (__thiscall *)(
 
 InitiateGameConnectionFn g_original_initiate = nullptr;
 void* g_initiate_target = nullptr;
-void** g_initiate_slot = nullptr;
 volatile LONG g_installed = 0;
 volatile LONG g_warning_visible = 0;
 
@@ -100,61 +100,6 @@ int __fastcall guarded_initiate_game_connection(
                     secure);
 }
 
-bool replace_vtable_slot(
-    void** slot,
-    void* replacement,
-    void** original,
-    const char* name) {
-    if (!slot || !replacement || !original) return false;
-
-    void* target = *slot;
-    if (!is_executable_address(target)) {
-        logger::log(
-            "VAC JOIN GUARD install failed: %s target is not executable target=%p slot=%p",
-            name, target, slot);
-        return false;
-    }
-
-    DWORD old_protect = 0;
-    if (!VirtualProtect(slot, sizeof(*slot), PAGE_READWRITE, &old_protect)) {
-        logger::log(
-            "VAC JOIN GUARD install failed: VirtualProtect %s slot=%p error=%lu",
-            name, slot, GetLastError());
-        return false;
-    }
-
-    // Publish the original before the replacement can be called on another
-    // thread.  Only this interface's dispatch slot is changed.  In
-    // particular, do not inline-patch the implementation address: Proton can
-    // expose shared/generated Steam client entry points whose code is also
-    // used by unrelated friend and persona operations.
-    *original = target;
-    MemoryBarrier();
-    void* observed = InterlockedCompareExchangePointer(
-        reinterpret_cast<void* volatile*>(slot), replacement, target);
-
-    DWORD ignored = 0;
-    const BOOL protection_restored =
-        VirtualProtect(slot, sizeof(*slot), old_protect, &ignored);
-
-    if (observed != target) {
-        logger::log(
-            "VAC JOIN GUARD install failed: %s slot changed concurrently "
-            "slot=%p expected=%p observed=%p",
-            name, slot, target, observed);
-        *original = nullptr;
-        return false;
-    }
-
-    if (!protection_restored) {
-        logger::log(
-            "VAC JOIN GUARD warning: could not restore %s vtable protection "
-            "slot=%p error=%lu",
-            name, slot, GetLastError());
-    }
-    return true;
-}
-
 }  // namespace
 
 bool install() {
@@ -206,21 +151,43 @@ bool install() {
         return false;
     }
 
-    if (!replace_vtable_slot(
-            initiate_slot,
-            reinterpret_cast<void*>(&guarded_initiate_game_connection),
-            reinterpret_cast<void**>(&g_original_initiate),
-            "InitiateGameConnection")) {
+    // Detour the method implementation rather than replacing the dispatch
+    // slot. This leaves the Proton bridge's shared vtable byte-for-byte
+    // unchanged, while calls through that slot still reach the guard.
+    const MH_STATUS init_status = MH_Initialize();
+    if (init_status != MH_OK && init_status != MH_ERROR_ALREADY_INITIALIZED) {
+        logger::log("VAC JOIN GUARD install failed: MH_Initialize status=%d",
+                    static_cast<int>(init_status));
+        return false;
+    }
+    const bool mh_owned_here = init_status == MH_OK;
+
+    const MH_STATUS create_status = MH_CreateHook(
+        initiate_target,
+        reinterpret_cast<void*>(&guarded_initiate_game_connection),
+        reinterpret_cast<void**>(&g_original_initiate));
+    if (create_status != MH_OK) {
+        logger::log("VAC JOIN GUARD install failed: MH_CreateHook target=%p status=%d",
+                    initiate_target, static_cast<int>(create_status));
+        if (mh_owned_here) MH_Uninitialize();
+        return false;
+    }
+
+    const MH_STATUS enable_status = MH_EnableHook(initiate_target);
+    if (enable_status != MH_OK) {
+        logger::log("VAC JOIN GUARD install failed: MH_EnableHook target=%p status=%d",
+                    initiate_target, static_cast<int>(enable_status));
+        MH_RemoveHook(initiate_target);
+        g_original_initiate = nullptr;
+        if (mh_owned_here) MH_Uninitialize();
         return false;
     }
 
     g_initiate_target = initiate_target;
-    g_initiate_slot = initiate_slot;
     InterlockedExchange(&g_installed, 1);
     logger::log(
-        "VAC JOIN GUARD installed without SteamMatchmaking hooks: "
-        "InitiateGameConnection slot=%p target=%p original=%p",
-        g_initiate_slot,
+        "VAC JOIN GUARD installed without Steam vtable modification: "
+        "InitiateGameConnection target=%p trampoline=%p",
         g_initiate_target,
         reinterpret_cast<void*>(g_original_initiate));
     return true;

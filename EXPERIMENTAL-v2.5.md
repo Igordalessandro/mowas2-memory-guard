@@ -4,16 +4,34 @@ This branch starts from the published v2.4.2 stable rollback build. It does
 not add SteamMatchmaking hooks and does not weaken either fail-closed VAC
 safeguard.
 
-The first experiment changes only memory resilience and observation:
+The current experiment changes memory resilience, observation, and the
+implementation of the existing VAC join boundary:
 
-- three staged address-space reserves (32 MiB, 16 MiB, and 16 MiB);
+- three staged address-space reserves (8 MiB, 8 MiB, and 48 MiB), preserving
+  the previous 64 MiB total while keeping a large contiguous last-chance block
+  for content-heavy mods;
+- staged release and re-scan before allocations of 8 MiB or larger, allowing
+  the guard to release enough adjacent reserve space for the current request;
+- proactive release of the final 48 MiB reserve when free address space falls
+  below 64 MiB or the largest free region falls below 6 MiB;
 - conservative primary-reserve re-arming after sustained recovery;
 - 64-bit diagnostic counters;
+- constant-time shutdown of per-callsite accounting when its fixed table is
+  saturated, while global and sampled diagnostics continue;
 - higher-level engine attribution for sampled retained allocations;
 - sampled per-heap statistics and heap compatibility reporting;
 - a fixed 256-entry allocation flight recorder;
 - one-second address-space scans during critical pressure; and
-- timestamped logs with the newest ten sessions retained.
+- timestamped detailed logs with the newest ten sessions retained; and
+- a continuously refreshed `DLL Crash Report.txt` containing the most useful
+  session, memory, allocation, hotspot, recovery, and exception fields in no
+  more than 900 ASCII bytes for direct use in one Steam comment.
+
+The secure-join guard no longer overwrites the Proton-owned SteamUser018
+vtable. It detours only the implementation already referenced by the
+`InitiateGameConnection` entry. This preserves the same `bSecure` refusal and
+fail-closed behavior without mutating the shared dispatch table implicated in
+persona-name corruption and a Proton Steam IPC-thread crash.
 
 The flight recorder, heap table, call-site table, and sample table are all
 fixed-size static storage. They do not allocate memory while the game is under
@@ -46,7 +64,8 @@ separate 64-bit game or protocol:
 Every experimental DLL must preserve all of these properties:
 
 1. Secure `SteamGameServer_Init` modes are rejected.
-2. `SteamUser018::InitiateGameConnection` is rejected when `bSecure` is true.
+2. `SteamUser018::InitiateGameConnection` is rejected when `bSecure` is true,
+   without modifying the SteamUser018 vtable.
 3. Failure to install either guard closes the game.
 4. Insecure hosting and joining continue to call the original Steam APIs.
 5. SteamMatchmaking and persona/friend interfaces are not modified.

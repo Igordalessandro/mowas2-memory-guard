@@ -114,7 +114,8 @@ static volatile LONG g_sample_lock = 0;
 static volatile LONG g_flight_sequence = 0;
 static volatile LONG g_sample_entries = 0;
 static volatile LONG g_sample_drops = 0;
-static volatile LONG g_callsite_drops = 0;
+static volatile LONG g_callsites_saturated = 0;
+__declspec(align(8)) static volatile LONG64 g_callsite_drops = 0;
 
 __declspec(align(8)) static volatile LONG64 g_heap_alloc_calls = 0;
 __declspec(align(8)) static volatile LONG64 g_heap_realloc_calls = 0;
@@ -232,6 +233,15 @@ static void record_flight_event(SIZE_T size, DWORD caller_rva_value, void* resul
 }
 
 static CallsiteStat* callsite_for(DWORD rva) {
+    // Once the fixed table is full, stop callsite accounting. Continuing to
+    // probe all 1024 slots on every allocation/free caused hundreds of
+    // billions of reads during long matches. Global and sampled counters keep
+    // running, while detailed callsite data remains as the pre-saturation
+    // snapshot.
+    if (InterlockedCompareExchange(&g_callsites_saturated, 0, 0) != 0) {
+        return nullptr;
+    }
+
     // Zero means unused, so keep the out-of-image sentinel but shift a true
     // RVA zero to one (the game has no allocation call at its DOS header).
     LONG key = static_cast<LONG>(rva == 0 ? 1u : rva);
@@ -245,7 +255,8 @@ static CallsiteStat* callsite_for(DWORD rva) {
             if (observed == 0 || observed == key) return &slot;
         }
     }
-    InterlockedIncrement(&g_callsite_drops);
+    InterlockedIncrement64(&g_callsite_drops);
+    InterlockedExchange(&g_callsites_saturated, 1);
     return nullptr;
 }
 
@@ -688,7 +699,7 @@ void log_summary(bool detailed) {
         ? static_cast<unsigned long long>(sampled_live) * SAMPLE_RATE : 0ull;
 
     logger::log(
-        "ALLOC PROFILE : heap alloc=%lld realloc=%lld free=%lld failures=%ld requested=%llu MiB | virtual alloc=%lld free=%lld failures=%ld requested=%llu MiB | samples=%ld live=%llu KiB estimate=%llu MiB drops=%ld sites_dropped=%ld",
+        "ALLOC PROFILE : heap alloc=%lld realloc=%lld free=%lld failures=%ld requested=%llu MiB | virtual alloc=%lld free=%lld failures=%ld requested=%llu MiB | samples=%ld live=%llu KiB estimate=%llu MiB drops=%ld sites_dropped=%lld sites_saturated=%ld",
         static_cast<long long>(load64(&g_heap_alloc_calls)),
         static_cast<long long>(load64(&g_heap_realloc_calls)),
         static_cast<long long>(load64(&g_heap_free_calls)),
@@ -702,7 +713,18 @@ void log_summary(bool detailed) {
         static_cast<unsigned long long>(sampled_live) / 1024ull,
         estimated_live / MiB,
         static_cast<long>(g_sample_drops),
-        static_cast<long>(g_callsite_drops));
+        static_cast<long long>(load64(&g_callsite_drops)),
+        static_cast<long>(InterlockedCompareExchange(&g_callsites_saturated, 0, 0)));
+    logger::report_allocator(
+        "alloc calls=%lld realloc=%lld free=%lld fail=%ld requested=%lluMiB sampled_live_est=%lluMiB drops=%ld sites_saturated=%ld",
+        static_cast<long long>(load64(&g_heap_alloc_calls)),
+        static_cast<long long>(load64(&g_heap_realloc_calls)),
+        static_cast<long long>(load64(&g_heap_free_calls)),
+        static_cast<long>(g_heap_failures),
+        static_cast<unsigned long long>(load64(&g_heap_requested_bytes)) / MiB,
+        estimated_live / MiB,
+        static_cast<long>(g_sample_drops),
+        static_cast<long>(InterlockedCompareExchange(&g_callsites_saturated, 0, 0)));
 
     if (!detailed) return;
     constexpr unsigned TOP_COUNT = 6;
@@ -730,6 +752,17 @@ void log_summary(bool detailed) {
         insert_top(top_live, TOP_COUNT, candidate, RANK_LIVE);
         insert_top(top_frees, TOP_COUNT, candidate, RANK_FREES);
         insert_top(top_engine, TOP_COUNT, candidate, RANK_ENGINE);
+    }
+
+    if (top_requested[0].requested > 0 || top_live[0].sample_live > 0) {
+        logger::report_hotspot(
+            "hot req=+%08lX/%lluMiB/%lldcalls retained=+%08lX/%lluMiB/%ldblocks",
+            static_cast<unsigned long>(top_requested[0].rva),
+            static_cast<unsigned long long>(top_requested[0].requested) / MiB,
+            static_cast<long long>(top_requested[0].calls),
+            static_cast<unsigned long>(top_live[0].rva),
+            static_cast<unsigned long long>(top_live[0].sample_live) * SAMPLE_RATE / MiB,
+            static_cast<long>(top_live[0].sample_live_count));
     }
 
     for (unsigned i = 0; i < TOP_COUNT && top_requested[i].requested > 0; ++i) {
