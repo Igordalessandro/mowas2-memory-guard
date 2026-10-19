@@ -5,6 +5,7 @@
 
 #include <windows.h>
 #include <psapi.h>
+#include <cstdio>
 #include <cstdint>
 
 namespace memory_guard {
@@ -49,6 +50,7 @@ __declspec(align(8)) static volatile LONG64 g_requestCount = 0;
 __declspec(align(8)) static volatile LONG64 g_requestedBytes = 0;
 static volatile LONG g_largestRequest = 0;
 static volatile LONG g_underPressure = 0;
+static volatile LONG g_finalProtectionLogged = 0;
 
 static AddressSpaceSnapshot scan_address_space() {
     AddressSpaceSnapshot result = {};
@@ -164,10 +166,18 @@ static void log_snapshot(const AddressSpaceSnapshot& snapshot, bool low) {
         largest / 1024,
         have_process ? static_cast<unsigned long long>(pmc.PrivateUsage) / MiB : 0ull,
         have_process ? static_cast<unsigned long long>(pmc.WorkingSetSize) / MiB : 0ull);
+    char largest_field[40] = {};
+    if (snapshot.largest_free < MiB) {
+        snprintf(largest_field, sizeof(largest_field), "largest=%lluKiB",
+                 static_cast<unsigned long long>(snapshot.largest_free) / 1024ull);
+    } else {
+        snprintf(largest_field, sizeof(largest_field), "largest=%lluMiB",
+                 static_cast<unsigned long long>(snapshot.largest_free) / MiB);
+    }
     logger::report_memory(
-        "mem free=%lluMiB largest=%luMiB commit=%lluMiB reserve=%lluMiB guard=%luMiB private=%lluMiB ws=%lluMiB req=%lld cum=%lluMiB max=%ldKiB",
+        "mem free=%lluMiB %s commit=%lluMiB reserve=%lluMiB guard=%luMiB private=%lluMiB ws=%lluMiB req=%lld total=%lluMiB max=%ldKiB",
         snapshot.free_bytes / MiB,
-        static_cast<unsigned long>(snapshot.largest_free / MiB),
+        largest_field,
         snapshot.committed_bytes / MiB,
         snapshot.reserved_bytes / MiB,
         reserve_mib,
@@ -200,7 +210,17 @@ static DWORD WINAPI monitor_thread(LPVOID) {
 
         if (low) release_primary(RELEASE_LOW_ADDRESS_SPACE);
         if (critical) release_critical(RELEASE_LOW_ADDRESS_SPACE);
-        if (emergency) release_final(RELEASE_LOW_ADDRESS_SPACE);
+        // Do not release the final contiguous block merely because general
+        // address-space pressure is high. The RobZ failure report showed that
+        // doing so let small allocations consume the block before a later
+        // ~33 MiB request arrived. Size-aware engine preflight and the
+        // low-level failure/retry paths remain authorized to release it.
+        if (emergency && g_finalReserve &&
+            InterlockedCompareExchange(&g_finalProtectionLogged, 1, 0) == 0) {
+            logger::log(
+                "MEM GUARD PROTECTED : final %lu MiB reserve held for a large request or allocation retry",
+                static_cast<unsigned long>(g_finalReserveSize / MiB));
+        }
 
         const DWORD now = GetTickCount();
         const bool recovered = !g_primaryReserve && g_criticalReserve && g_finalReserve &&
@@ -398,6 +418,10 @@ void record_failure(std::size_t size, const char* hook_name,
                          hook_name ? hook_name : "unknown", size,
                          reserve_released ? "yes" : "no",
                          retry_succeeded ? "succeeded" : "failed");
+    logger::report_failure("failure=%s bytes=%zu reserve=%s retry=%s",
+                           hook_name ? hook_name : "unknown", size,
+                           reserve_released ? "yes" : "no",
+                           retry_succeeded ? "ok" : "failed");
     logger::flush_now();
 }
 

@@ -2,7 +2,7 @@
 
 > [!IMPORTANT]
 > The `experimental/allocator-diagnostics-v2.5` branch is not the public stable
-> release. Its DLL identifies itself as `2.5.0-experimental.5`. Use the v2.4.2
+> release. Its DLL identifies itself as `2.5.0-experimental.6`. Use the v2.4.2
 > GitHub release for the stable rollback build.
 
 An experimental 32-bit proxy DLL for the Steam edition of *Men of War: Assault
@@ -104,10 +104,11 @@ overwrite the game's `DLL Crash Report.txt`.
 - Releases the primary reserve when total free address space, the largest
   contiguous block, or an upcoming large request indicates exhaustion is near.
   The critical reserve has a lower threshold. Large requests release and
-  re-scan stages until enough contiguous headroom exists; the final reserve is
-  also released proactively under emergency fragmentation or after an observed
-  failure. The primary reserve can be re-armed after address space remains
-  healthy for a full minute.
+  re-scan stages until enough contiguous headroom exists. Experimental.6 keeps
+  the final contiguous reserve protected from ordinary small-allocation churn;
+  it is released only for a size-aware large request or an observed allocation
+  failure and retry. The primary reserve can be re-armed after address space
+  remains healthy for a full minute.
 - Hooks the executable's `HeapAlloc`, `HeapReAlloc`, `HeapFree`,
   `VirtualAlloc`, and `VirtualFree` imports without replacing their allocator
   semantics. On an allocation failure it releases remaining reserves and
@@ -194,7 +195,9 @@ also placed in `%TEMP%` so the proxy can forward both `ImageNtHeader` and
 The same folder contains **`DLL Crash Report.txt`**. It is overwritten for
 each run and continuously refreshed with the version, platform, guard status,
 latest memory snapshot, allocator totals, hottest sampled call sites, last
-recovery event, and any captured unhandled exception. It contains ASCII only
+recovery event, a sticky exact last-allocation-failure field, and any captured
+unhandled exception. Sub-1 MiB contiguous regions are reported in KiB instead
+of rounding to zero. It contains ASCII only
 and has a hard 900-byte ceiling so the entire file fits in Steam's roughly
 1,000-character comment limit. A report remains useful after a silent crash,
 but it can also describe a healthy or still-running session.

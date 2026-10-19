@@ -12,8 +12,9 @@ implementation of the existing VAC join boundary:
   for content-heavy mods;
 - staged release and re-scan before allocations of 8 MiB or larger, allowing
   the guard to release enough adjacent reserve space for the current request;
-- proactive release of the final 48 MiB reserve when free address space falls
-  below 64 MiB or the largest free region falls below 6 MiB;
+- protection of the final 48 MiB reserve from ordinary small-allocation churn,
+  releasing it only for a size-aware large request or an observed allocation
+  failure and retry;
 - conservative primary-reserve re-arming after sustained recovery;
 - 64-bit diagnostic counters;
 - constant-time shutdown of per-callsite accounting when its fixed table is
@@ -26,6 +27,15 @@ implementation of the existing VAC join boundary:
 - a continuously refreshed `DLL Crash Report.txt` containing the most useful
   session, memory, allocation, hotspot, recovery, and exception fields in no
   more than 900 ASCII bytes for direct use in one Steam comment.
+
+Experimental.6 changes that final-reserve policy in response to a native
+Windows RobZ report. The older policy released the 48 MiB block under general
+emergency pressure; small allocations then consumed it before a later request
+of roughly 33 MiB arrived. Experimental.6 holds the contiguous block until a
+large request is known or a low-level allocation has actually failed. The
+compact report also preserves the exact most recent allocation failure,
+reports sub-1 MiB contiguous space in KiB, and uses `total=` instead of the
+Steam-filtered `cum=` label.
 
 The secure-join guard no longer overwrites the Proton-owned SteamUser018
 vtable. It detours only the implementation already referenced by the

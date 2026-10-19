@@ -3,7 +3,7 @@
 // Target binary: mowas_2.exe v3.262.1 (Steam Oct 2019).
 #define MOWAS2_PREFERRED_BASE       0x00400000
 
-#define MEMORY_GUARD_VERSION        "2.5.0-experimental.5"
+#define MEMORY_GUARD_VERSION        "2.5.0-experimental.6"
 
 #define OFFSET_ENGINE_ALLOC         0x00809041
 #define OFFSET_ENGINE_ALLOC_CORE    0x0010E4F0
@@ -26,6 +26,9 @@
 #define RELEASE_LARGEST_FREE_MB      24u
 #define CRITICAL_TOTAL_FREE_MB        96u
 #define CRITICAL_LARGEST_FREE_MB       8u
+// Diagnostic emergency boundary. Crossing it increases monitoring frequency,
+// but the final reserve is deliberately held for a size-aware large request
+// or an observed allocation failure instead of being consumed by small churn.
 #define FINAL_TOTAL_FREE_MB            64u
 #define FINAL_LARGEST_FREE_MB           6u
 #define REARM_TOTAL_FREE_MB          768u

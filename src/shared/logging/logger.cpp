@@ -24,6 +24,7 @@ static char g_reportMemory[160] = {"mem=not_available"};
 static char g_reportAllocator[160] = {"alloc=not_available"};
 static char g_reportHotspot[128] = {"hotspot=not_available"};
 static char g_reportEvent[128] = {"event=startup"};
+static char g_reportFailure[144] = {"failure=none_observed"};
 static char g_reportCrash[160] = {"crash=not_captured_or_session_still_running"};
 
 static void append_report_line(char* output, size_t capacity,
@@ -50,6 +51,7 @@ static void rewrite_compact_report_locked() {
     append_report_line(output, CRASH_REPORT_MAX_BYTES, &used, g_reportSession);
     append_report_line(output, CRASH_REPORT_MAX_BYTES, &used, g_reportConfig);
     append_report_line(output, CRASH_REPORT_MAX_BYTES, &used, g_reportCrash);
+    append_report_line(output, CRASH_REPORT_MAX_BYTES, &used, g_reportFailure);
     append_report_line(output, CRASH_REPORT_MAX_BYTES, &used, g_reportEvent);
     append_report_line(output, CRASH_REPORT_MAX_BYTES, &used, g_reportMemory);
     append_report_line(output, CRASH_REPORT_MAX_BYTES, &used, g_reportAllocator);
@@ -115,11 +117,10 @@ static void initialize_report_header() {
              architecture_name(native_info.wProcessorArchitecture), wow64 ? "yes" : "no",
              have_memory ? static_cast<unsigned long long>(memory.ullTotalPhys) / (1024ull * 1024ull) : 0ull);
     snprintf(g_reportConfig, sizeof(g_reportConfig),
-             "guard=%u/%u/%uMiB thresholds=%u/%u,%u/%u,%u/%uMiB report_max=%uB",
+             "guard=%u/%u/%uMiB release=%u/%u,%u/%uMiB final=on-demand report_max=%uB",
              PRIMARY_RESERVE_MB, CRITICAL_RESERVE_MB, FINAL_RESERVE_MB,
              RELEASE_TOTAL_FREE_MB, RELEASE_LARGEST_FREE_MB,
              CRITICAL_TOTAL_FREE_MB, CRITICAL_LARGEST_FREE_MB,
-             FINAL_TOTAL_FREE_MB, FINAL_LARGEST_FREE_MB,
              CRASH_REPORT_MAX_BYTES);
 }
 
@@ -360,6 +361,13 @@ void report_event(const char* fmt, ...) {
     va_list args;
     va_start(args, fmt);
     update_report_field(g_reportEvent, sizeof(g_reportEvent), true, fmt, args);
+    va_end(args);
+}
+
+void report_failure(const char* fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    update_report_field(g_reportFailure, sizeof(g_reportFailure), true, fmt, args);
     va_end(args);
 }
 

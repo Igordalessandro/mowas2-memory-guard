@@ -384,6 +384,10 @@ static void log_low_level_failure(const char* api, SIZE_T size, DWORD rva,
         size,
         static_cast<unsigned long>(rva),
         reserve_released ? "yes" : "no");
+    logger::report_failure(
+        "failure=%s bytes=%zu site=+%08lX reserve=%s retry=%s",
+        api, size, static_cast<unsigned long>(rva),
+        reserve_released ? "yes" : "no", recovered ? "ok" : "failed");
     log_summary(true);
     logger::flush_now();
 }
@@ -470,6 +474,11 @@ static LPVOID WINAPI profiled_virtual_alloc(LPVOID address, SIZE_T size,
             static_cast<unsigned long>(rva),
             static_cast<unsigned long>(original_error),
             released ? "yes" : "no");
+        logger::report_failure(
+            "failure=VirtualAlloc bytes=%zu site=+%08lX err=%lu reserve=%s retry=%s",
+            size, static_cast<unsigned long>(rva),
+            static_cast<unsigned long>(original_error),
+            released ? "yes" : "no", result ? "ok" : "failed");
         log_summary(true);
         log_flight_recorder();
         logger::flush_now();

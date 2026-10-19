@@ -13,6 +13,7 @@ void report_memory(const char* fmt, ...);
 void report_allocator(const char* fmt, ...);
 void report_hotspot(const char* fmt, ...);
 void report_event(const char* fmt, ...);
+void report_failure(const char* fmt, ...);
 void report_crash(const char* fmt, ...);
 
 void flush_now();
