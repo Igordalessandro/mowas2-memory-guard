@@ -2,7 +2,7 @@
 
 > [!IMPORTANT]
 > The `experimental/allocator-diagnostics-v2.5` branch is not the public stable
-> release. Its DLL identifies itself as `2.5.0-experimental.4`. Use the v2.4.2
+> release. Its DLL identifies itself as `2.5.0-experimental.5`. Use the v2.4.2
 > GitHub release for the stable rollback build.
 
 An experimental 32-bit proxy DLL for the Steam edition of *Men of War: Assault
@@ -80,6 +80,15 @@ override; both configure the same DLL preference.
 Close the game and remove `dbghelp.dll` from its directory. On Linux, also
 remove the Steam launch option or the Protontricks `dbghelp` override. The DLL
 does not modify saves or permanently patch `mowas_2.exe`.
+
+### Editor and Workshop compatibility
+
+Version `2.5.0-experimental.5` and newer recognize the executable that loaded
+the shared `dbghelp.dll`. The memory hooks, reserves, diagnostics, and VAC
+guards run only inside the supported `mowas_2.exe`. `mowas_2_ed.exe`,
+`mowas_2_workshop.exe`, and unrelated executables receive only transparent
+forwarding to the real system `dbghelp.dll`. Utility launches therefore do not
+overwrite the game's `DLL Crash Report.txt`.
 
 ## What it does
 

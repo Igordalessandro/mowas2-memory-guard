@@ -37,6 +37,16 @@ The flight recorder, heap table, call-site table, and sample table are all
 fixed-size static storage. They do not allocate memory while the game is under
 pressure.
 
+## Editor and utility compatibility
+
+Starting with `2.5.0-experimental.5`, initialization is gated by the loading
+executable. Only `mowas_2.exe` starts the memory guard, allocator hooks,
+diagnostics, crash recorder, and fail-closed VAC safeguards. The map editor
+(`mowas_2_ed.exe`), Workshop utility (`mowas_2_workshop.exe`), and unrelated
+programs use proxy-only mode, which forwards the required `dbghelp` functions
+without installing game-specific hooks or replacing the game's compact crash
+report.
+
 ## Architecture compatibility
 
 This experiment is still a **32-bit x86 DLL** for the 32-bit

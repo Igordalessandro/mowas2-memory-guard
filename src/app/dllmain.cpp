@@ -75,6 +75,17 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID /*lpReserved*/) {
     if (reason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(hModule);
 
+        // dbghelp.dll is loaded by the map editor and Workshop utility from
+        // the same directory as the game. Those executables need only the
+        // transparent dbghelp exports; their code layout and Steam imports do
+        // not match mowas_2.exe. Starting the game-only fail-closed guards in
+        // either utility would therefore terminate an otherwise valid tool.
+        if (!GetModuleHandleW(L"mowas_2.exe")) {
+            OutputDebugStringA(
+                "mowas2-memory-guard: non-game executable; proxy-only mode\n");
+            return TRUE;
+        }
+
         HANDLE th = CreateThread(nullptr, 0, &delayed_init_thread, nullptr, 0, nullptr);
         if (th) {
             CloseHandle(th);

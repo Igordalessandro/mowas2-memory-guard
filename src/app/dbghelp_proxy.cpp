@@ -48,7 +48,13 @@ static void fail_init(bool permanent) {
 
 // Lazy : DllMain's loader-lock forbids CopyFileW / LoadLibraryW here.
 static void ensure_init() {
-    logger::init();
+    // The editor and Workshop utility load this proxy from the shared game
+    // directory. Forward dbghelp for them, but do not create/overwrite game
+    // telemetry or the compact crash report. DllMain independently applies
+    // the same executable gate before starting any game-only worker.
+    if (GetModuleHandleW(L"mowas_2.exe")) {
+        logger::init();
+    }
     for (;;) {
         LONG prev = InterlockedCompareExchange(&g_initOnce, STATE_BUSY, STATE_PENDING);
         if (prev == STATE_DONE || prev == STATE_PERMANENT_FAIL) return;
