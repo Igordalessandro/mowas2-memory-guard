@@ -2,7 +2,7 @@
 
 > [!IMPORTANT]
 > The `experimental/allocator-diagnostics-v2.5` branch is not the public stable
-> release. Its DLL identifies itself as `2.5.0-experimental.6`. Use the v2.4.2
+> release. Its DLL identifies itself as `2.5.0-experimental.7`. Use the v2.4.2
 > GitHub release for the stable rollback build.
 
 An experimental 32-bit proxy DLL for the Steam edition of *Men of War: Assault
@@ -113,6 +113,11 @@ overwrite the game's `DLL Crash Report.txt`.
   `VirtualAlloc`, and `VirtualFree` imports without replacing their allocator
   semantics. On an allocation failure it releases remaining reserves and
   retries the same request once.
+- Rewrites file-system paths of 248 characters or more to absolute Windows
+  extended-length form for the game executable's file-open, enumeration, and
+  attribute calls. This targets multiplayer resource checking without changing
+  resource bytes, hashes, mod identifiers, or network packets. The detailed log
+  records the API, length, result, and error code without recording the path.
 - Records 64-bit allocation counts, the largest request, committed/reserved memory,
   total free address space, and the largest free region every 30 seconds.
   "64-bit" here describes the diagnostic integer width only: the DLL remains
@@ -132,9 +137,10 @@ overwrite the game's `DLL Crash Report.txt`.
 
 This is not a 64-bit conversion or garbage collector. It cannot reclaim live
 objects owned by the engine, eliminate all fragmentation, or guarantee that an
-out-of-memory crash will never occur. The supported executable is already
-Large Address Aware, so applying a separate 4 GB patch does not raise its
-address-space limit further.
+out-of-memory crash will never occur. It also cannot reconstruct a path that
+the game already truncated inside an internal fixed-size buffer. The supported
+executable is already Large Address Aware, so applying a separate 4 GB patch
+does not raise its address-space limit further.
 
 ### VAC safety guards
 

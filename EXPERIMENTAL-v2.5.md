@@ -37,6 +37,13 @@ compact report also preserves the exact most recent allocation failure,
 reports sub-1 MiB contiguous space in KiB, and uses `total=` instead of the
 Steam-filtered `cum=` label.
 
+Experimental.7 adds a game-only long-path compatibility layer for multiplayer
+resource checking. File opens, enumeration, and attribute queries made with
+paths of 248 characters or more are passed to Windows using absolute
+extended-length paths. The detailed log records whether these rewrites succeed
+without recording users' path text. This does not alter resource hashes or
+network data, and it cannot recover a path already truncated inside the game.
+
 The secure-join guard no longer overwrites the Proton-owned SteamUser018
 vtable. It detours only the implementation already referenced by the
 `InitiateGameConnection` entry. This preserves the same `bSecure` refusal and
