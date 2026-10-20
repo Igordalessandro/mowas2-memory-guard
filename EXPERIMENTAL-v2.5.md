@@ -1,9 +1,9 @@
 # v2.5 allocator-diagnostics experiment
 
-The development candidate is `2.5.0-experimental.9-dev`; experimental.8 remains
-the latest published prerelease. The [2026-10-20 review record](docs/REVIEW-2026-10-20.md)
+The current prerelease is `2.5.0-experimental.9`, prepared from the reviewed
+experimental.9-dev candidate. The [2026-10-20 review record](docs/REVIEW-2026-10-20.md)
 describes the concurrency, allocator-observation, path, and crash-report repairs
-being prepared for the next release.
+included in this release.
 
 This branch starts from the published v2.4.2 stable rollback build. It does
 not add SteamMatchmaking hooks and does not weaken either fail-closed VAC

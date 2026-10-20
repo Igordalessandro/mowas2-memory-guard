@@ -2,9 +2,8 @@
 
 > [!IMPORTANT]
 > The `experimental/allocator-diagnostics-v2.5` branch is not the public stable
-> release. The development DLL identifies itself as `2.5.0-experimental.9-dev`;
-> the latest published prerelease is experimental.8. Use the v2.4.2 GitHub
-> release for the stable rollback build.
+> release. Its DLL identifies itself as `2.5.0-experimental.9`. Use the v2.4.2
+> GitHub release for the stable rollback build.
 
 An experimental 32-bit proxy DLL for the Steam edition of *Men of War: Assault
 Squad 2*. It mitigates the known 2 GB lobby-allocation crash, keeps emergency
