@@ -374,20 +374,23 @@ static bool remove_sample(void* pointer, DWORD* size, DWORD* alloc_rva, DWORD* l
 }
 
 static void log_low_level_failure(const char* api, SIZE_T size, DWORD rva,
-                                  bool reserve_released, bool recovered) {
+                                  SIZE_T released_bytes, unsigned retry_count,
+                                  bool recovered) {
     InterlockedIncrement(&g_heap_failures);
     record_failure_site(rva);
     logger::log(
-        "LOW-LEVEL ALLOC FAILURE%s : %s size=%zu caller=mowas_2.exe+0x%08lX reserve_released=%s",
+        "LOW-LEVEL ALLOC FAILURE%s : %s size=%zu caller=mowas_2.exe+0x%08lX released=%llu MiB retries=%u",
         recovered ? " RECOVERED" : "",
         api,
         size,
         static_cast<unsigned long>(rva),
-        reserve_released ? "yes" : "no");
+        static_cast<unsigned long long>(released_bytes) / MiB,
+        retry_count);
     logger::report_failure(
-        "failure=%s bytes=%zu site=+%08lX reserve=%s retry=%s",
+        "failure=%s bytes=%zu site=+%08lX released=%lluMiB retries=%u result=%s",
         api, size, static_cast<unsigned long>(rva),
-        reserve_released ? "yes" : "no", recovered ? "ok" : "failed");
+        static_cast<unsigned long long>(released_bytes) / MiB, retry_count,
+        recovered ? "ok" : retry_count ? "failed" : "not_attempted");
     log_summary(true);
     logger::flush_now();
 }
@@ -402,12 +405,28 @@ static LPVOID WINAPI profiled_heap_alloc(HANDLE heap, DWORD flags, SIZE_T size) 
 
     LPVOID result = g_originalHeapAlloc(heap, flags, size);
     if (!result) {
-        const bool released = memory_guard::release_after_failure();
-        if (released) result = g_originalHeapAlloc(heap, flags, size);
+        SIZE_T released_bytes = 0;
+        unsigned retry_count = 0;
+        bool recovery_stage_released = false;
+        for (;;) {
+            const memory_guard::ReleasedReserve released =
+                memory_guard::release_after_failure();
+            if (released.bytes == 0) break;
+            released_bytes += released.bytes;
+            recovery_stage_released =
+                recovery_stage_released || released.recovery_stage;
+            ++retry_count;
+            result = g_originalHeapAlloc(heap, flags, size);
+            if (result) break;
+        }
         record_flight_event(size, rva, result, heap,
                             FLIGHT_FAILURE | (result ? FLIGHT_RECOVERED : 0u));
-        log_low_level_failure("HeapAlloc", size, rva, released, result != nullptr);
+        log_low_level_failure("HeapAlloc", size, rva, released_bytes,
+                              retry_count, result != nullptr);
         log_flight_recorder();
+        if (result && recovery_stage_released) {
+            memory_guard::rearm_recovery_if_needed();
+        }
     }
     if (result) insert_sample(result, size, rva, heap);
     return result;
@@ -424,12 +443,28 @@ static LPVOID WINAPI profiled_heap_realloc(HANDLE heap, DWORD flags,
 
     LPVOID result = g_originalHeapReAlloc(heap, flags, pointer, size);
     if (!result) {
-        const bool released = memory_guard::release_after_failure();
-        if (released) result = g_originalHeapReAlloc(heap, flags, pointer, size);
+        SIZE_T released_bytes = 0;
+        unsigned retry_count = 0;
+        bool recovery_stage_released = false;
+        for (;;) {
+            const memory_guard::ReleasedReserve released =
+                memory_guard::release_after_failure();
+            if (released.bytes == 0) break;
+            released_bytes += released.bytes;
+            recovery_stage_released =
+                recovery_stage_released || released.recovery_stage;
+            ++retry_count;
+            result = g_originalHeapReAlloc(heap, flags, pointer, size);
+            if (result) break;
+        }
         record_flight_event(size, rva, result, heap,
                             FLIGHT_FAILURE | (result ? FLIGHT_RECOVERED : 0u));
-        log_low_level_failure("HeapReAlloc", size, rva, released, result != nullptr);
+        log_low_level_failure("HeapReAlloc", size, rva, released_bytes,
+                              retry_count, result != nullptr);
         log_flight_recorder();
+        if (result && recovery_stage_released) {
+            memory_guard::rearm_recovery_if_needed();
+        }
     }
     if (result) {
         remove_sample(pointer, nullptr, nullptr, nullptr);
@@ -460,28 +495,45 @@ static LPVOID WINAPI profiled_virtual_alloc(LPVOID address, SIZE_T size,
     LPVOID result = g_originalVirtualAlloc(address, size, allocation_type, protect);
     if (!result && size != 0) {
         const DWORD original_error = GetLastError();
-        const bool released = memory_guard::release_after_failure();
-        if (released) result = g_originalVirtualAlloc(address, size, allocation_type, protect);
+        SIZE_T released_bytes = 0;
+        unsigned retry_count = 0;
+        bool recovery_stage_released = false;
+        for (;;) {
+            const memory_guard::ReleasedReserve released =
+                memory_guard::release_after_failure();
+            if (released.bytes == 0) break;
+            released_bytes += released.bytes;
+            recovery_stage_released =
+                recovery_stage_released || released.recovery_stage;
+            ++retry_count;
+            result = g_originalVirtualAlloc(address, size, allocation_type, protect);
+            if (result) break;
+        }
         InterlockedIncrement(&g_virtual_failures);
         record_failure_site(rva);
         record_flight_event(size, rva, result, nullptr,
                             FLIGHT_FAILURE | (result ? FLIGHT_RECOVERED : 0u));
         logger::log(
-            "LOW-LEVEL VIRTUAL FAILURE%s : VirtualAlloc size=%zu type=0x%08lX caller=mowas_2.exe+0x%08lX error=%lu reserve_released=%s",
+            "LOW-LEVEL VIRTUAL FAILURE%s : VirtualAlloc size=%zu type=0x%08lX caller=mowas_2.exe+0x%08lX error=%lu released=%llu MiB retries=%u",
             result ? " RECOVERED" : "",
             size,
             static_cast<unsigned long>(allocation_type),
             static_cast<unsigned long>(rva),
             static_cast<unsigned long>(original_error),
-            released ? "yes" : "no");
+            static_cast<unsigned long long>(released_bytes) / MiB,
+            retry_count);
         logger::report_failure(
-            "failure=VirtualAlloc bytes=%zu site=+%08lX err=%lu reserve=%s retry=%s",
+            "failure=VirtualAlloc bytes=%zu site=+%08lX err=%lu released=%lluMiB retries=%u result=%s",
             size, static_cast<unsigned long>(rva),
             static_cast<unsigned long>(original_error),
-            released ? "yes" : "no", result ? "ok" : "failed");
+            static_cast<unsigned long long>(released_bytes) / MiB, retry_count,
+            result ? "ok" : retry_count ? "failed" : "not_attempted");
         log_summary(true);
         log_flight_recorder();
         logger::flush_now();
+        if (result && recovery_stage_released) {
+            memory_guard::rearm_recovery_if_needed();
+        }
         if (!result) SetLastError(original_error);
     }
     return result;
@@ -533,7 +585,8 @@ static void restore_slot(IatPatch& patch) {
 static bool find_iat_slots(std::uintptr_t base, IatPatch* patches, unsigned count) {
     auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
     if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
-    auto* nt = reinterpret_cast<IMAGE_NT_HEADERS32*>(base + dos->e_lfanew);
+    auto* nt = reinterpret_cast<IMAGE_NT_HEADERS32*>(
+        base + static_cast<std::uintptr_t>(dos->e_lfanew));
     if (nt->Signature != IMAGE_NT_SIGNATURE ||
         nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR32_MAGIC) return false;
 

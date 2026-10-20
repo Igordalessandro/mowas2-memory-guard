@@ -117,8 +117,9 @@ static void initialize_report_header() {
              architecture_name(native_info.wProcessorArchitecture), wow64 ? "yes" : "no",
              have_memory ? static_cast<unsigned long long>(memory.ullTotalPhys) / (1024ull * 1024ull) : 0ull);
     snprintf(g_reportConfig, sizeof(g_reportConfig),
-             "guard=%u/%u/%uMiB release=%u/%u,%u/%uMiB final=on-demand report_max=%uB",
+             "guard=%u/%u/%u/%uMiB release=%u/%u,%u/%uMiB final=segmented report_max=%uB",
              PRIMARY_RESERVE_MB, CRITICAL_RESERVE_MB, FINAL_RESERVE_MB,
+             RECOVERY_RESERVE_MB,
              RELEASE_TOTAL_FREE_MB, RELEASE_LARGEST_FREE_MB,
              CRITICAL_TOTAL_FREE_MB, CRITICAL_LARGEST_FREE_MB,
              CRASH_REPORT_MAX_BYTES);

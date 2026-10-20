@@ -7,14 +7,14 @@ safeguard.
 The current experiment changes memory resilience, observation, and the
 implementation of the existing VAC join boundary:
 
-- three staged address-space reserves (8 MiB, 8 MiB, and 48 MiB), preserving
-  the previous 64 MiB total while keeping a large contiguous last-chance block
-  for content-heavy mods;
+- four staged address-space reserves (8 MiB, 8 MiB, 48 MiB, and 32 MiB),
+  keeping separate contiguous large-request and failure-only blocks for
+  content-heavy mods;
 - staged release and re-scan before allocations of 8 MiB or larger, allowing
   the guard to release enough adjacent reserve space for the current request;
-- protection of the final 48 MiB reserve from ordinary small-allocation churn,
-  releasing it only for a size-aware large request or an observed allocation
-  failure and retry;
+- protection of the 48 MiB block from ordinary small-allocation churn and the
+  separate 32 MiB block from all preflight release, with one-stage retries and
+  adaptive recovery-block re-arming after a successful retry;
 - conservative primary-reserve re-arming after sustained recovery;
 - 64-bit diagnostic counters;
 - constant-time shutdown of per-callsite accounting when its fixed table is
@@ -43,6 +43,17 @@ paths of 248 characters or more are passed to Windows using absolute
 extended-length paths. The detailed log records whether these rewrites succeed
 without recording users' path text. This does not alter resource hashes or
 network data, and it cannot recover a path already truncated inside the game.
+
+Experimental.8 responds to a second native-Windows RobZ report. A roughly
+33 MiB request had already consumed the 48 MiB final reserve; later, a heap
+backing request just over 16 MiB failed with 55 MiB total VA free but only a
+4 MiB largest hole. The process accounted for roughly 4,094 MiB of its x86
+address space and no guard remained. Experimental.8 therefore adds a separate
+32 MiB failure-only recovery reserve, releases and retries one stage at a time,
+reduces large-request preflight margin from 16 MiB to 4 MiB so the recovery
+stage stays protected, and adaptively re-reserves 8–32 MiB after a successful
+recovery when a sufficiently large region remains. Reports now distinguish a
+failed retry from a retry that was never attempted because no reserve remained.
 
 The secure-join guard no longer overwrites the Proton-owned SteamUser018
 vtable. It detours only the implementation already referenced by the

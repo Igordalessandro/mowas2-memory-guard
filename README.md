@@ -2,7 +2,7 @@
 
 > [!IMPORTANT]
 > The `experimental/allocator-diagnostics-v2.5` branch is not the public stable
-> release. Its DLL identifies itself as `2.5.0-experimental.7`. Use the v2.4.2
+> release. Its DLL identifies itself as `2.5.0-experimental.8`. Use the v2.4.2
 > GitHub release for the stable rollback build.
 
 An experimental 32-bit proxy DLL for the Steam edition of *Men of War: Assault
@@ -97,22 +97,24 @@ overwrite the game's `DLL Crash Report.txt`.
 - Hooks both known engine allocation entry points.
 - Replaces only the observed corrupt `2,147,483,552`-byte lobby request with a
   4 MiB request. It does not broadly shrink every large allocation.
-- Holds 64 MiB of uncommitted emergency virtual address space in three stages:
-  an 8 MiB primary reserve, an 8 MiB critical reserve, and a contiguous 48 MiB
-  final reserve suitable for the large requests observed while loading heavy
-  mods such as RobZ.
+- Holds 96 MiB of uncommitted emergency virtual address space in four stages:
+  an 8 MiB primary reserve, an 8 MiB critical reserve, a contiguous 48 MiB
+  large-request reserve, and a separate 32 MiB failure-only recovery reserve
+  for the next heap expansion observed after heavy-mod loading.
 - Releases the primary reserve when total free address space, the largest
   contiguous block, or an upcoming large request indicates exhaustion is near.
   The critical reserve has a lower threshold. Large requests release and
-  re-scan stages until enough contiguous headroom exists. Experimental.6 keeps
-  the final contiguous reserve protected from ordinary small-allocation churn;
-  it is released only for a size-aware large request or an observed allocation
-  failure and retry. The primary reserve can be re-armed after address space
-  remains healthy for a full minute.
+  re-scan stages until enough contiguous headroom exists. Experimental.8 keeps
+  the 32 MiB recovery stage out of large-request preflight and releases reserve
+  stages one at a time, retrying after each release. After a successful recovery
+  it attempts to protect another 8–32 MiB piece of the largest remaining free
+  region. The primary reserve can be re-armed after address space remains
+  healthy for a full minute.
 - Hooks the executable's `HeapAlloc`, `HeapReAlloc`, `HeapFree`,
   `VirtualAlloc`, and `VirtualFree` imports without replacing their allocator
-  semantics. On an allocation failure it releases remaining reserves and
-  retries the same request once.
+  semantics. On an allocation failure it releases at most one remaining stage,
+  retries the identical request, and advances to the next stage only if that
+  retry also fails.
 - Rewrites file-system paths of 248 characters or more to absolute Windows
   extended-length form for the game executable's file-open, enumeration, and
   attribute calls. This targets multiplayer resource checking without changing

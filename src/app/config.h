@@ -3,7 +3,7 @@
 // Target binary: mowas_2.exe v3.262.1 (Steam Oct 2019).
 #define MOWAS2_PREFERRED_BASE       0x00400000
 
-#define MEMORY_GUARD_VERSION        "2.5.0-experimental.7"
+#define MEMORY_GUARD_VERSION        "2.5.0-experimental.8"
 
 #define OFFSET_ENGINE_ALLOC         0x00809041
 #define OFFSET_ENGINE_ALLOC_CORE    0x0010E4F0
@@ -14,14 +14,18 @@
 #define KNOWN_BAD_LOBBY_ALLOCATION  ((size_t)2147483552u) // 0x7fffffa0
 #define LOBBY_ALLOCATION_REPLACEMENT ((size_t)(4u * 1024u * 1024u))
 
-// Three reserved (not committed) virtual-address ranges are released in
-// stages. The final block is released at the last safe address-space boundary
-// because the engine can terminate internally before returning an allocation
-// failure to our hooks. The primary block can be re-armed after a sustained
-// recovery.
+// Four reserved (not committed) virtual-address ranges are released in
+// stages. The 48 MiB final block services a known large request; the separate
+// 32 MiB recovery block remains protected until an allocation actually fails.
+// This preserves a second contiguous chance after a large mod request consumes
+// and fragments the first block.
 #define PRIMARY_RESERVE_MB            8u
 #define CRITICAL_RESERVE_MB           8u
 #define FINAL_RESERVE_MB             48u
+#define RECOVERY_RESERVE_MB          32u
+#define RECOVERY_REARM_MIN_MB         8u
+#define RECOVERY_REARM_SLACK_MB       8u
+#define LARGE_ALLOCATION_MARGIN_MB    4u
 #define RELEASE_TOTAL_FREE_MB       192u
 #define RELEASE_LARGEST_FREE_MB      24u
 #define CRITICAL_TOTAL_FREE_MB        96u

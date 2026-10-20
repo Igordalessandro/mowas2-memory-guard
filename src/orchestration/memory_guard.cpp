@@ -25,7 +25,9 @@ enum ReleaseEvent : LONG {
     EVENT_PRIMARY = 1,
     EVENT_CRITICAL = 2,
     EVENT_FINAL = 4,
-    EVENT_PRIMARY_REARMED = 8,
+    EVENT_RECOVERY = 8,
+    EVENT_PRIMARY_REARMED = 16,
+    EVENT_RECOVERY_REARMED = 32,
 };
 
 struct AddressSpaceSnapshot {
@@ -39,13 +41,22 @@ struct AddressSpaceSnapshot {
 static PVOID volatile g_primaryReserve = nullptr;
 static PVOID volatile g_criticalReserve = nullptr;
 static PVOID volatile g_finalReserve = nullptr;
+static PVOID volatile g_recoveryReserve = nullptr;
 static SIZE_T g_primaryReserveSize = 0;
 static SIZE_T g_criticalReserveSize = 0;
 static SIZE_T g_finalReserveSize = 0;
+static SIZE_T g_recoveryReserveSize = 0;
+static volatile LONG g_recoveryReleasedMiB = 0;
 static volatile LONG g_primaryReleaseReason = RELEASE_NONE;
 static volatile LONG g_criticalReleaseReason = RELEASE_NONE;
 static volatile LONG g_finalReleaseReason = RELEASE_NONE;
+static volatile LONG g_recoveryReleaseReason = RELEASE_NONE;
 static volatile LONG g_releaseEvents = EVENT_NONE;
+// 0 = no re-arm, 1 = recovery reserve released and retry outcome unknown,
+// 2 = a retry succeeded and re-arm is allowed.
+static volatile LONG g_recoveryRearmPending = 0;
+static volatile LONG g_recoveryRearmBusy = 0;
+static volatile LONG g_recoveryRearmOwnerThread = 0;
 __declspec(align(8)) static volatile LONG64 g_requestCount = 0;
 __declspec(align(8)) static volatile LONG64 g_requestedBytes = 0;
 static volatile LONG g_largestRequest = 0;
@@ -116,6 +127,20 @@ static bool release_final(ReleaseReason reason) {
                            &g_finalReleaseReason, EVENT_FINAL, reason);
 }
 
+static bool release_recovery(ReleaseReason reason) {
+    const SIZE_T released_size = g_recoveryReserveSize;
+    if (!release_reserve(&g_recoveryReserve,
+                         &g_recoveryReleaseReason, EVENT_RECOVERY, reason)) {
+        return false;
+    }
+    InterlockedExchange(&g_recoveryReleasedMiB,
+                        static_cast<LONG>(released_size / MiB));
+    InterlockedExchange(&g_recoveryRearmOwnerThread,
+                        static_cast<LONG>(GetCurrentThreadId()));
+    InterlockedExchange(&g_recoveryRearmPending, 1);
+    return true;
+}
+
 static void* reserve_high_end(const AddressSpaceSnapshot& snapshot, SIZE_T bytes) {
     if (!snapshot.largest_free_base || snapshot.largest_free < bytes) return nullptr;
 
@@ -131,6 +156,49 @@ static void* reserve_high_end(const AddressSpaceSnapshot& snapshot, SIZE_T bytes
     return VirtualAlloc(reinterpret_cast<LPVOID>(desired), bytes, MEM_RESERVE, PAGE_NOACCESS);
 }
 
+static bool try_rearm_recovery(const AddressSpaceSnapshot& snapshot) {
+    if (InterlockedCompareExchangePointer(&g_recoveryReserve, nullptr, nullptr)) {
+        InterlockedExchange(&g_recoveryRearmPending, 0);
+        InterlockedExchange(&g_recoveryRearmOwnerThread, 0);
+        return true;
+    }
+    if (InterlockedCompareExchange(&g_recoveryRearmPending, 0, 0) != 2) return false;
+    if (InterlockedCompareExchange(&g_recoveryRearmBusy, 1, 0) != 0) return false;
+
+    const SIZE_T slack = static_cast<SIZE_T>(RECOVERY_REARM_SLACK_MB) *
+                         static_cast<SIZE_T>(MiB);
+    SIZE_T candidate = static_cast<SIZE_T>(RECOVERY_RESERVE_MB) *
+                       static_cast<SIZE_T>(MiB);
+    const SIZE_T minimum = static_cast<SIZE_T>(RECOVERY_REARM_MIN_MB) *
+                           static_cast<SIZE_T>(MiB);
+    while (candidate >= minimum &&
+           (snapshot.largest_free < candidate + slack ||
+            snapshot.free_bytes < static_cast<unsigned long long>(candidate) + slack)) {
+        candidate -= static_cast<SIZE_T>(8u) * static_cast<SIZE_T>(MiB);
+    }
+
+    bool rearmed = false;
+    if (candidate >= minimum) {
+        void* replacement = reserve_high_end(snapshot, candidate);
+        if (replacement) {
+            g_recoveryReserveSize = candidate;
+            void* observed = InterlockedCompareExchangePointer(
+                &g_recoveryReserve, replacement, nullptr);
+            if (!observed) {
+                InterlockedExchange(&g_recoveryRearmPending, 0);
+                InterlockedExchange(&g_recoveryRearmOwnerThread, 0);
+                InterlockedOr(&g_releaseEvents, EVENT_RECOVERY_REARMED);
+                rearmed = true;
+            } else {
+                VirtualFree(replacement, 0, MEM_RELEASE);
+            }
+        }
+    }
+
+    InterlockedExchange(&g_recoveryRearmBusy, 0);
+    return rearmed;
+}
+
 static void log_snapshot(const AddressSpaceSnapshot& snapshot, bool low) {
     PROCESS_MEMORY_COUNTERS_EX pmc = {};
     pmc.cb = sizeof(pmc);
@@ -143,14 +211,17 @@ static void log_snapshot(const AddressSpaceSnapshot& snapshot, bool low) {
         ? static_cast<unsigned long>(g_criticalReserveSize / MiB) : 0ul;
     const unsigned long final_mib = g_finalReserve
         ? static_cast<unsigned long>(g_finalReserveSize / MiB) : 0ul;
-    const unsigned long reserve_mib = primary_mib + critical_mib + final_mib;
+    const unsigned long recovery_mib = g_recoveryReserve
+        ? static_cast<unsigned long>(g_recoveryReserveSize / MiB) : 0ul;
+    const unsigned long reserve_mib =
+        primary_mib + critical_mib + final_mib + recovery_mib;
     const LONG64 count = InterlockedCompareExchange64(&g_requestCount, 0, 0);
     const LONG64 requested = g_requestedBytes;
     const LONG largest = g_largestRequest;
 
     logger::log(
         "MEM%s : VA free=%llu MiB largest=%lu MiB @ %p committed=%llu MiB reserved=%llu MiB "
-        "guard=%lu MiB (primary=%lu critical=%lu final=%lu) | requests=%lld cumulative=%llu MiB max_request=%ld KiB | private=%llu MiB working_set=%llu MiB",
+        "guard=%lu MiB (primary=%lu critical=%lu final=%lu recovery=%lu) | requests=%lld cumulative=%llu MiB max_request=%ld KiB | private=%llu MiB working_set=%llu MiB",
         low ? " WARNING" : "",
         snapshot.free_bytes / MiB,
         static_cast<unsigned long>(snapshot.largest_free / MiB),
@@ -161,6 +232,7 @@ static void log_snapshot(const AddressSpaceSnapshot& snapshot, bool low) {
         primary_mib,
         critical_mib,
         final_mib,
+        recovery_mib,
         static_cast<long long>(count),
         static_cast<unsigned long long>(requested) / MiB,
         largest / 1024,
@@ -220,6 +292,12 @@ static DWORD WINAPI monitor_thread(LPVOID) {
             logger::log(
                 "MEM GUARD PROTECTED : final %lu MiB reserve held for a large request or allocation retry",
                 static_cast<unsigned long>(g_finalReserveSize / MiB));
+        }
+
+        if (InterlockedCompareExchange(&g_recoveryRearmPending, 0, 0) == 2 &&
+            !g_recoveryReserve &&
+            try_rearm_recovery(snapshot)) {
+            snapshot = scan_address_space();
         }
 
         const DWORD now = GetTickCount();
@@ -282,9 +360,33 @@ static DWORD WINAPI monitor_thread(LPVOID) {
                 logger::report_event("event=reserve_release stage=final size=%luMiB reason=%s",
                                      static_cast<unsigned long>(g_finalReserveSize / MiB), label);
             }
+            if (events & EVENT_RECOVERY) {
+                const LONG reason = InterlockedExchange(
+                    &g_recoveryReleaseReason, RELEASE_NONE);
+                const LONG released_mib = InterlockedExchange(
+                    &g_recoveryReleasedMiB, 0);
+                const char* label = reason == RELEASE_ALLOCATION_FAILURE
+                    ? "allocation failure" :
+                    reason == RELEASE_LARGE_REQUEST
+                    ? "large allocation request" : "explicit recovery request";
+                logger::log(
+                    "MEM GUARD RELEASED : recovery %ld MiB VA reserve (%s)",
+                    static_cast<long>(released_mib), label);
+                logger::report_event(
+                    "event=reserve_release stage=recovery size=%ldMiB reason=%s",
+                    static_cast<long>(released_mib), label);
+            }
             if (events & EVENT_PRIMARY_REARMED) {
                 logger::log("MEM GUARD REARMED : primary %lu MiB VA reserve after sustained recovery",
                             static_cast<unsigned long>(g_primaryReserveSize / MiB));
+            }
+            if (events & EVENT_RECOVERY_REARMED) {
+                logger::log(
+                    "MEM GUARD REARMED : recovery %lu MiB VA reserve from largest remaining region",
+                    static_cast<unsigned long>(g_recoveryReserveSize / MiB));
+                logger::report_event(
+                    "event=reserve_rearmed stage=recovery size=%luMiB",
+                    static_cast<unsigned long>(g_recoveryReserveSize / MiB));
             }
             snapshot = scan_address_space();
             log_snapshot(snapshot, true);
@@ -330,22 +432,38 @@ bool install() {
         final = VirtualAlloc(nullptr, final_wanted, MEM_RESERVE, PAGE_NOACCESS);
     }
 
+    AddressSpaceSnapshot after_final = scan_address_space();
+    SIZE_T recovery_wanted = static_cast<SIZE_T>(RECOVERY_RESERVE_MB) *
+                             static_cast<SIZE_T>(MiB);
+    void* recovery = reserve_high_end(after_final, recovery_wanted);
+    if (!recovery) {
+        recovery = VirtualAlloc(nullptr, recovery_wanted, MEM_RESERVE, PAGE_NOACCESS);
+    }
+    if (!recovery) {
+        recovery_wanted /= 2;
+        recovery = VirtualAlloc(nullptr, recovery_wanted, MEM_RESERVE, PAGE_NOACCESS);
+    }
+
     g_primaryReserveSize = primary ? primary_wanted : 0;
     g_criticalReserveSize = critical ? critical_wanted : 0;
     g_finalReserveSize = final ? final_wanted : 0;
+    g_recoveryReserveSize = recovery ? recovery_wanted : 0;
     InterlockedExchangePointer(&g_primaryReserve, primary);
     InterlockedExchangePointer(&g_criticalReserve, critical);
     InterlockedExchangePointer(&g_finalReserve, final);
-    logger::log("MEM GUARD : staged reserves primary=%p size=%lu MiB critical=%p size=%lu MiB final=%p size=%lu MiB",
+    InterlockedExchangePointer(&g_recoveryReserve, recovery);
+    logger::log("MEM GUARD : staged reserves primary=%p size=%lu MiB critical=%p size=%lu MiB final=%p size=%lu MiB recovery=%p size=%lu MiB",
                 primary, static_cast<unsigned long>(g_primaryReserveSize / MiB),
                 critical, static_cast<unsigned long>(g_criticalReserveSize / MiB),
-                final, static_cast<unsigned long>(g_finalReserveSize / MiB));
+                final, static_cast<unsigned long>(g_finalReserveSize / MiB),
+                recovery, static_cast<unsigned long>(g_recoveryReserveSize / MiB));
     log_snapshot(scan_address_space(), false);
 
     HANDLE thread = CreateThread(nullptr, 0, &monitor_thread, nullptr, 0, nullptr);
     if (!thread) {
         logger::log("MEM GUARD : monitor thread creation failed err=%lu", GetLastError());
-        return primary != nullptr || critical != nullptr || final != nullptr;
+        return primary != nullptr || critical != nullptr || final != nullptr ||
+               recovery != nullptr;
     }
     CloseHandle(thread);
     return true;
@@ -354,7 +472,8 @@ bool install() {
 void before_allocation(std::size_t size) {
     if (size < 8u * 1024u * 1024u) return;
 
-    const unsigned long long margin = 16ull * MiB;
+    const unsigned long long margin =
+        static_cast<unsigned long long>(LARGE_ALLOCATION_MARGIN_MB) * MiB;
     const unsigned long long needed_total = static_cast<unsigned long long>(size) + margin;
     const SIZE_T max_size = static_cast<SIZE_T>(-1);
     const SIZE_T needed_largest = size > max_size - static_cast<SIZE_T>(margin)
@@ -373,6 +492,8 @@ void before_allocation(std::size_t size) {
     // and re-scan one stage at a time so a large mod allocation can recover a
     // sufficiently large contiguous region before the engine aborts. The
     // final 48 MiB stage is used only when the smaller stages are insufficient.
+    // The separate recovery block is deliberately not released by preflight;
+    // it remains available for a later observed allocation failure.
     if (release_primary(RELEASE_LARGE_REQUEST)) {
         snapshot = scan_address_space();
         if (has_headroom(snapshot)) return;
@@ -384,11 +505,32 @@ void before_allocation(std::size_t size) {
     release_final(RELEASE_LARGE_REQUEST);
 }
 
-bool release_after_failure() {
-    const bool primary = release_primary(RELEASE_ALLOCATION_FAILURE);
-    const bool critical = release_critical(RELEASE_ALLOCATION_FAILURE);
-    const bool final = release_final(RELEASE_ALLOCATION_FAILURE);
-    return primary || critical || final;
+ReleasedReserve release_after_failure() {
+    if (release_primary(RELEASE_ALLOCATION_FAILURE)) {
+        return {g_primaryReserveSize, false};
+    }
+    if (release_critical(RELEASE_ALLOCATION_FAILURE)) {
+        return {g_criticalReserveSize, false};
+    }
+    if (release_final(RELEASE_ALLOCATION_FAILURE)) {
+        return {g_finalReserveSize, false};
+    }
+    if (release_recovery(RELEASE_ALLOCATION_FAILURE)) {
+        return {g_recoveryReserveSize, true};
+    }
+    return {0, false};
+}
+
+void rearm_recovery_if_needed() {
+    LONG state = InterlockedCompareExchange(&g_recoveryRearmPending, 0, 0);
+    if (state == 1) {
+        const LONG owner = InterlockedCompareExchange(
+            &g_recoveryRearmOwnerThread, 0, 0);
+        if (owner != static_cast<LONG>(GetCurrentThreadId())) return;
+        InterlockedCompareExchange(&g_recoveryRearmPending, 2, 1);
+    }
+    if (InterlockedCompareExchange(&g_recoveryRearmPending, 0, 0) != 2) return;
+    try_rearm_recovery(scan_address_space());
 }
 
 bool is_under_pressure() {
@@ -409,19 +551,24 @@ void record_request(std::size_t size) {
 }
 
 void record_failure(std::size_t size, const char* hook_name,
-                    bool reserve_released, bool retry_succeeded) {
+                    std::size_t released_bytes, unsigned retry_count,
+                    bool retry_succeeded) {
     logger::log("ALLOC FAILURE%s : %s requested=%zu bytes reserve_released=%s",
                 retry_succeeded ? " RECOVERED" : "",
                 hook_name ? hook_name : "unknown", size,
-                reserve_released ? "yes" : "no");
-    logger::report_event("event=alloc_failure hook=%s bytes=%zu reserve_released=%s retry=%s",
+                released_bytes ? "yes" : "no");
+    logger::report_event("event=alloc_failure hook=%s bytes=%zu released=%zuMiB retries=%u result=%s",
                          hook_name ? hook_name : "unknown", size,
-                         reserve_released ? "yes" : "no",
-                         retry_succeeded ? "succeeded" : "failed");
-    logger::report_failure("failure=%s bytes=%zu reserve=%s retry=%s",
+                         released_bytes / static_cast<std::size_t>(MiB),
+                         retry_count,
+                         retry_succeeded ? "recovered" :
+                         retry_count ? "failed" : "not_attempted");
+    logger::report_failure("failure=%s bytes=%zu released=%zuMiB retries=%u result=%s",
                            hook_name ? hook_name : "unknown", size,
-                           reserve_released ? "yes" : "no",
-                           retry_succeeded ? "ok" : "failed");
+                           released_bytes / static_cast<std::size_t>(MiB),
+                           retry_count,
+                           retry_succeeded ? "ok" :
+                           retry_count ? "failed" : "not_attempted");
     logger::flush_now();
 }
 
