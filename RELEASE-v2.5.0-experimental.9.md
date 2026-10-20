@@ -55,7 +55,9 @@ as errors. The final DLL is PE32/i386 with the two expected forwarding exports.
 The regression tests exercise production recovery, allocator, path, crash,
 logger, proxy-comparison and VAC policy code using controlled substitutes.
 They do not prove live Steam/Proton interoperability or RobZ match stability.
-The added GitHub workflow executes the suites on Linux and Windows.
+The [GitHub regression run](https://github.com/Igordalessandro/mowas2-memory-guard/actions/runs/39387404224)
+passed on Linux and executed all nine regression executables successfully on
+native Windows x86. A real RobZ session is still required for field validation.
 
 Full findings and future investigation priorities are in
 [`docs/REVIEW-2026-10-20.md`](https://github.com/Igordalessandro/mowas2-memory-guard/blob/v2.5.0-experimental.9/docs/REVIEW-2026-10-20.md).
