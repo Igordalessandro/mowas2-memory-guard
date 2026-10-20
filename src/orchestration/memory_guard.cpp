@@ -1,4 +1,5 @@
 #include "orchestration/memory_guard.h"
+#include "orchestration/recovery_state.h"
 
 #include "app/config.h"
 #include "shared/logging/logger.h"
@@ -41,22 +42,28 @@ struct AddressSpaceSnapshot {
 static PVOID volatile g_primaryReserve = nullptr;
 static PVOID volatile g_criticalReserve = nullptr;
 static PVOID volatile g_finalReserve = nullptr;
-static PVOID volatile g_recoveryReserve = nullptr;
 static SIZE_T g_primaryReserveSize = 0;
 static SIZE_T g_criticalReserveSize = 0;
 static SIZE_T g_finalReserveSize = 0;
-static SIZE_T g_recoveryReserveSize = 0;
 static volatile LONG g_recoveryReleasedMiB = 0;
+static volatile LONG g_recoveryRearmedMiB = 0;
 static volatile LONG g_primaryReleaseReason = RELEASE_NONE;
 static volatile LONG g_criticalReleaseReason = RELEASE_NONE;
 static volatile LONG g_finalReleaseReason = RELEASE_NONE;
 static volatile LONG g_recoveryReleaseReason = RELEASE_NONE;
 static volatile LONG g_releaseEvents = EVENT_NONE;
-// 0 = no re-arm, 1 = recovery reserve released and retry outcome unknown,
-// 2 = a retry succeeded and re-arm is allowed.
-static volatile LONG g_recoveryRearmPending = 0;
-static volatile LONG g_recoveryRearmBusy = 0;
-static volatile LONG g_recoveryRearmOwnerThread = 0;
+// Recovery reserve ownership and its retry/re-arm metadata form one state.
+// Serialize their transitions so a thread releasing a newly published reserve
+// cannot have its pending retry overwritten by the thread that re-armed it.
+// Only rare failure/re-arm paths acquire this lock; ordinary allocations do not.
+struct RecoveryMutex {
+    SRWLOCK lock_value = SRWLOCK_INIT;
+    void lock() { AcquireSRWLockExclusive(&lock_value); }
+    bool try_lock() { return TryAcquireSRWLockExclusive(&lock_value) != FALSE; }
+    void unlock() { ReleaseSRWLockExclusive(&lock_value); }
+};
+using GuardRecoveryState = RecoveryState<RecoveryMutex>;
+static GuardRecoveryState g_recovery;
 __declspec(align(8)) static volatile LONG64 g_requestCount = 0;
 __declspec(align(8)) static volatile LONG64 g_requestedBytes = 0;
 static volatile LONG g_largestRequest = 0;
@@ -127,18 +134,16 @@ static bool release_final(ReleaseReason reason) {
                            &g_finalReleaseReason, EVENT_FINAL, reason);
 }
 
-static bool release_recovery(ReleaseReason reason) {
-    const SIZE_T released_size = g_recoveryReserveSize;
-    if (!release_reserve(&g_recoveryReserve,
-                         &g_recoveryReleaseReason, EVENT_RECOVERY, reason)) {
-        return false;
-    }
-    InterlockedExchange(&g_recoveryReleasedMiB,
-                        static_cast<LONG>(released_size / MiB));
-    InterlockedExchange(&g_recoveryRearmOwnerThread,
-                        static_cast<LONG>(GetCurrentThreadId()));
-    InterlockedExchange(&g_recoveryRearmPending, 1);
-    return true;
+static SIZE_T release_recovery(ReleaseReason reason) {
+    return g_recovery.release(GetCurrentThreadId(),
+        [reason](const GuardRecoveryState::Reservation& reserve) {
+            if (!VirtualFree(reserve.address, 0, MEM_RELEASE)) return false;
+            InterlockedExchange(&g_recoveryReleasedMiB,
+                                static_cast<LONG>(reserve.bytes / MiB));
+            InterlockedExchange(&g_recoveryReleaseReason, reason);
+            InterlockedOr(&g_releaseEvents, EVENT_RECOVERY);
+            return true;
+        });
 }
 
 static void* reserve_high_end(const AddressSpaceSnapshot& snapshot, SIZE_T bytes) {
@@ -157,46 +162,32 @@ static void* reserve_high_end(const AddressSpaceSnapshot& snapshot, SIZE_T bytes
 }
 
 static bool try_rearm_recovery(const AddressSpaceSnapshot& snapshot) {
-    if (InterlockedCompareExchangePointer(&g_recoveryReserve, nullptr, nullptr)) {
-        InterlockedExchange(&g_recoveryRearmPending, 0);
-        InterlockedExchange(&g_recoveryRearmOwnerThread, 0);
-        return true;
-    }
-    if (InterlockedCompareExchange(&g_recoveryRearmPending, 0, 0) != 2) return false;
-    if (InterlockedCompareExchange(&g_recoveryRearmBusy, 1, 0) != 0) return false;
-
-    const SIZE_T slack = static_cast<SIZE_T>(RECOVERY_REARM_SLACK_MB) *
-                         static_cast<SIZE_T>(MiB);
-    SIZE_T candidate = static_cast<SIZE_T>(RECOVERY_RESERVE_MB) *
-                       static_cast<SIZE_T>(MiB);
-    const SIZE_T minimum = static_cast<SIZE_T>(RECOVERY_REARM_MIN_MB) *
+    // A competing release must publish its owner and pending state before we
+    // inspect them. Skip a busy re-arm attempt instead of adding polling to a
+    // successful allocation's return path; the monitor will try again later.
+    return g_recovery.try_rearm([&snapshot]() -> GuardRecoveryState::Reservation {
+        const SIZE_T slack = static_cast<SIZE_T>(RECOVERY_REARM_SLACK_MB) *
+                             static_cast<SIZE_T>(MiB);
+        SIZE_T candidate = static_cast<SIZE_T>(RECOVERY_RESERVE_MB) *
                            static_cast<SIZE_T>(MiB);
-    while (candidate >= minimum &&
-           (snapshot.largest_free < candidate + slack ||
-            snapshot.free_bytes < static_cast<unsigned long long>(candidate) + slack)) {
-        candidate -= static_cast<SIZE_T>(8u) * static_cast<SIZE_T>(MiB);
-    }
-
-    bool rearmed = false;
-    if (candidate >= minimum) {
-        void* replacement = reserve_high_end(snapshot, candidate);
-        if (replacement) {
-            g_recoveryReserveSize = candidate;
-            void* observed = InterlockedCompareExchangePointer(
-                &g_recoveryReserve, replacement, nullptr);
-            if (!observed) {
-                InterlockedExchange(&g_recoveryRearmPending, 0);
-                InterlockedExchange(&g_recoveryRearmOwnerThread, 0);
+        const SIZE_T minimum = static_cast<SIZE_T>(RECOVERY_REARM_MIN_MB) *
+                               static_cast<SIZE_T>(MiB);
+        while (candidate >= minimum &&
+               (snapshot.largest_free < candidate + slack ||
+                snapshot.free_bytes < static_cast<unsigned long long>(candidate) + slack)) {
+            candidate -= static_cast<SIZE_T>(8u) * static_cast<SIZE_T>(MiB);
+        }
+        if (candidate >= minimum) {
+            void* replacement = reserve_high_end(snapshot, candidate);
+            if (replacement) {
+                InterlockedExchange(&g_recoveryRearmedMiB,
+                                    static_cast<LONG>(candidate / MiB));
                 InterlockedOr(&g_releaseEvents, EVENT_RECOVERY_REARMED);
-                rearmed = true;
-            } else {
-                VirtualFree(replacement, 0, MEM_RELEASE);
+                return {replacement, candidate};
             }
         }
-    }
-
-    InterlockedExchange(&g_recoveryRearmBusy, 0);
-    return rearmed;
+        return {nullptr, 0};
+    });
 }
 
 static void log_snapshot(const AddressSpaceSnapshot& snapshot, bool low) {
@@ -211,12 +202,13 @@ static void log_snapshot(const AddressSpaceSnapshot& snapshot, bool low) {
         ? static_cast<unsigned long>(g_criticalReserveSize / MiB) : 0ul;
     const unsigned long final_mib = g_finalReserve
         ? static_cast<unsigned long>(g_finalReserveSize / MiB) : 0ul;
-    const unsigned long recovery_mib = g_recoveryReserve
-        ? static_cast<unsigned long>(g_recoveryReserveSize / MiB) : 0ul;
+    const auto recovery = g_recovery.snapshot();
+    const unsigned long recovery_mib =
+        static_cast<unsigned long>(recovery.reserve.bytes / MiB);
     const unsigned long reserve_mib =
         primary_mib + critical_mib + final_mib + recovery_mib;
     const LONG64 count = InterlockedCompareExchange64(&g_requestCount, 0, 0);
-    const LONG64 requested = g_requestedBytes;
+    const LONG64 requested = InterlockedCompareExchange64(&g_requestedBytes, 0, 0);
     const LONG largest = g_largestRequest;
 
     logger::log(
@@ -294,8 +286,8 @@ static DWORD WINAPI monitor_thread(LPVOID) {
                 static_cast<unsigned long>(g_finalReserveSize / MiB));
         }
 
-        if (InterlockedCompareExchange(&g_recoveryRearmPending, 0, 0) == 2 &&
-            !g_recoveryReserve &&
+        const auto recovery = g_recovery.snapshot();
+        if (recovery.rearm_allowed &&
             try_rearm_recovery(snapshot)) {
             snapshot = scan_address_space();
         }
@@ -381,12 +373,13 @@ static DWORD WINAPI monitor_thread(LPVOID) {
                             static_cast<unsigned long>(g_primaryReserveSize / MiB));
             }
             if (events & EVENT_RECOVERY_REARMED) {
+                const LONG rearmed_mib = InterlockedExchange(&g_recoveryRearmedMiB, 0);
                 logger::log(
                     "MEM GUARD REARMED : recovery %lu MiB VA reserve from largest remaining region",
-                    static_cast<unsigned long>(g_recoveryReserveSize / MiB));
+                    static_cast<unsigned long>(rearmed_mib));
                 logger::report_event(
                     "event=reserve_rearmed stage=recovery size=%luMiB",
-                    static_cast<unsigned long>(g_recoveryReserveSize / MiB));
+                    static_cast<unsigned long>(rearmed_mib));
             }
             snapshot = scan_address_space();
             log_snapshot(snapshot, true);
@@ -447,16 +440,15 @@ bool install() {
     g_primaryReserveSize = primary ? primary_wanted : 0;
     g_criticalReserveSize = critical ? critical_wanted : 0;
     g_finalReserveSize = final ? final_wanted : 0;
-    g_recoveryReserveSize = recovery ? recovery_wanted : 0;
     InterlockedExchangePointer(&g_primaryReserve, primary);
     InterlockedExchangePointer(&g_criticalReserve, critical);
     InterlockedExchangePointer(&g_finalReserve, final);
-    InterlockedExchangePointer(&g_recoveryReserve, recovery);
+    g_recovery.initialize(recovery, recovery_wanted);
     logger::log("MEM GUARD : staged reserves primary=%p size=%lu MiB critical=%p size=%lu MiB final=%p size=%lu MiB recovery=%p size=%lu MiB",
                 primary, static_cast<unsigned long>(g_primaryReserveSize / MiB),
                 critical, static_cast<unsigned long>(g_criticalReserveSize / MiB),
                 final, static_cast<unsigned long>(g_finalReserveSize / MiB),
-                recovery, static_cast<unsigned long>(g_recoveryReserveSize / MiB));
+                recovery, static_cast<unsigned long>(recovery ? recovery_wanted / MiB : 0));
     log_snapshot(scan_address_space(), false);
 
     HANDLE thread = CreateThread(nullptr, 0, &monitor_thread, nullptr, 0, nullptr);
@@ -515,21 +507,15 @@ ReleasedReserve release_after_failure() {
     if (release_final(RELEASE_ALLOCATION_FAILURE)) {
         return {g_finalReserveSize, false};
     }
-    if (release_recovery(RELEASE_ALLOCATION_FAILURE)) {
-        return {g_recoveryReserveSize, true};
+    const SIZE_T recovery_bytes = release_recovery(RELEASE_ALLOCATION_FAILURE);
+    if (recovery_bytes != 0) {
+        return {recovery_bytes, true};
     }
     return {0, false};
 }
 
 void rearm_recovery_if_needed() {
-    LONG state = InterlockedCompareExchange(&g_recoveryRearmPending, 0, 0);
-    if (state == 1) {
-        const LONG owner = InterlockedCompareExchange(
-            &g_recoveryRearmOwnerThread, 0, 0);
-        if (owner != static_cast<LONG>(GetCurrentThreadId())) return;
-        InterlockedCompareExchange(&g_recoveryRearmPending, 2, 1);
-    }
-    if (InterlockedCompareExchange(&g_recoveryRearmPending, 0, 0) != 2) return;
+    if (!g_recovery.authorize_rearm(GetCurrentThreadId())) return;
     try_rearm_recovery(scan_address_space());
 }
 

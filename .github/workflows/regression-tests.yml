@@ -1,0 +1,38 @@
+name: DLL regression tests
+on:
+  push:
+    paths: ['src/**', 'tests/**', '.github/workflows/regression-tests.yml']
+  pull_request:
+    paths: ['src/**', 'tests/**', '.github/workflows/regression-tests.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test production recovery state, report format and retry policy
+        run: bash tests/run-native.sh
+        env:
+          MOWAS2_TEST_SANITIZERS: '1'
+  windows-x86:
+    runs-on: windows-2022
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Download and verify pinned compiler
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP 'llvm-mingw.zip'
+          Invoke-WebRequest 'https://github.com/mstorsjo/llvm-mingw/releases/download/20261006/llvm-mingw-20261006-ucrt-x86_64.zip' -OutFile $archive
+          $expected = '317492c456aa27ee607a5919f1d2d38dcdc1112516a24d0bf4b00d078f52d17a'
+          if ((Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant() -ne $expected) { throw 'Toolchain checksum mismatch' }
+          Expand-Archive $archive -DestinationPath $env:RUNNER_TEMP
+          "LLVM_MINGW_ROOT=$env:RUNNER_TEMP/llvm-mingw-20261006-ucrt-x86_64" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Execute isolated 32-bit Windows regressions
+        shell: pwsh
+        run: ./tests/run-windows.ps1

@@ -12,8 +12,8 @@ if [[ ! -x "$cc" || ! -x "$cxx" ]]; then
     exit 1
 fi
 
-build_dir="$project_root/build-linux"
-dist_dir="$project_root/dist"
+build_dir=${MOWAS2_BUILD_DIR:-"$project_root/build-linux"}
+dist_dir=${MOWAS2_DIST_DIR:-"$project_root/dist"}
 mkdir -p "$build_dir" "$dist_dir"
 rm -f "$build_dir"/*.o
 

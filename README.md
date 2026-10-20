@@ -2,8 +2,9 @@
 
 > [!IMPORTANT]
 > The `experimental/allocator-diagnostics-v2.5` branch is not the public stable
-> release. Its DLL identifies itself as `2.5.0-experimental.8`. Use the v2.4.2
-> GitHub release for the stable rollback build.
+> release. The development DLL identifies itself as `2.5.0-experimental.9-dev`;
+> the latest published prerelease is experimental.8. Use the v2.4.2 GitHub
+> release for the stable rollback build.
 
 An experimental 32-bit proxy DLL for the Steam edition of *Men of War: Assault
 Squad 2*. It mitigates the known 2 GB lobby-allocation crash, keeps emergency
@@ -200,15 +201,23 @@ newest ten sessions are retained. A copy of the real Windows `dbghelp.dll` is
 also placed in `%TEMP%` so the proxy can forward both `ImageNtHeader` and
 `MiniDumpWriteDump`.
 
-The same folder contains **`DLL Crash Report.txt`**. It is overwritten for
-each run and continuously refreshed with the version, platform, guard status,
+The same folder contains **`DLL Crash Report.txt`**. Before each new run,
+the development build saves its previous contents as
+`DLL Crash Report.previous.txt`. The current file is continuously refreshed
+with the version, platform, guard status,
 latest memory snapshot, allocator totals, hottest sampled call sites, last
 recovery event, a sticky exact last-allocation-failure field, and any captured
 unhandled exception. Sub-1 MiB contiguous regions are reported in KiB instead
 of rounding to zero. It contains ASCII only
 and has a hard 900-byte ceiling so the entire file fits in Steam's roughly
-1,000-character comment limit. A report remains useful after a silent crash,
-but it can also describe a healthy or still-running session.
+1,000-character comment limit. Lines are kept whole; crash, allocation failure,
+session and memory data take priority if optional details do not fit.
+`omitted=optional_fields` means the detailed session log contains more data.
+A report remains useful after a silent crash,
+but it can also describe a healthy or still-running session. The development
+build also writes a small `DLL Emergency Crash.txt` before regular exception
+formatting, preserving basic evidence even if the logger is busy; its previous
+session is saved as `DLL Emergency Crash.previous.txt`.
 
 When reporting a problem, paste the entire contents of `DLL Crash Report.txt`
 and separately state the active mods, last in-game action, and whether the game
@@ -259,6 +268,34 @@ LLVM_MINGW_ROOT=/opt/llvm-mingw ./build-linux.sh
 ```
 
 The script auto-discovers every `.cpp` under `src/`, compiles MinHook from the submodule sources, and links the result to `dist/dbghelp.dll`. Drop a new `.cpp` in any domain folder and it gets picked up on the next build.
+
+To keep a development build separate from a published DLL, set
+`MOWAS2_BUILD_DIR` and `MOWAS2_DIST_DIR` when running `build-linux.sh`.
+
+### Regression checks
+
+Run the portable tests on Linux before building:
+
+```sh
+bash tests/run-native.sh
+MOWAS2_TEST_SANITIZERS=1 bash tests/run-native.sh
+```
+
+On Windows, use the pinned llvm-mingw toolchain and run:
+
+```powershell
+$env:LLVM_MINGW_ROOT = 'C:\tools\llvm-mingw-20261006-ucrt-x86_64'
+./tests/run-windows.ps1
+```
+
+The Windows tests exercise the production file, allocator, crash and VAC
+wrappers with controlled substitutes. They do not launch the game, contact
+Steam, install hooks, or show dialogs. The GitHub workflow runs both suites;
+cross-compiling Windows tests alone does not count as executing them.
+
+See [the review record](docs/REVIEW-2026-10-20.md) for the development fixes,
+their limits, and outstanding field validation. Community reports come from
+[this Steam discussion](https://steamcommunity.com/app/244450/discussions/0/591817814333171584/).
 
 The resulting `dist/dbghelp.dll` goes in the game folder. The v2 artifact built from this working copy is intentionally different from the upstream v1 release.
 

@@ -17,7 +17,8 @@ struct ReleasedReserve {
 };
 
 // Releases at most one reserve stage. Callers may retry once per released
-// stage instead of exposing every remaining block at once.
+// stage instead of exposing every remaining block at once. Recovery-reserve
+// ownership and re-arm transitions are serialized across allocating threads.
 ReleasedReserve release_after_failure();
 
 // If the failure-only reserve was consumed by a successful retry, attempt to

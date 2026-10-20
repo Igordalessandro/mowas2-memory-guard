@@ -2,6 +2,7 @@
 
 #include <windows.h>
 
+#include "app/dbghelp_proxy.h"
 #include "shared/logging/logger.h"
 #include "diagnostics/crash_report.h"
 #include "orchestration/hooks.h"
@@ -34,6 +35,12 @@ static DWORD WINAPI delayed_init_thread(LPVOID) {
             MB_OK | MB_ICONERROR | MB_SETFOREGROUND);
         ExitProcess(ERROR_ACCESS_DISABLED_BY_POLICY);
         return ERROR_ACCESS_DISABLED_BY_POLICY;
+    }
+
+    // Loading dbghelp for the first time during an out-of-memory crash can
+    // itself fail. Resolve it on the worker before reserving emergency VA.
+    if (!dbghelp_proxy::prewarm()) {
+        logger::log("delayed_init: system dbghelp prewarm failed; proxy will retry on demand");
     }
 
     if (!memory_guard::install()) {

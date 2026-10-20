@@ -1,5 +1,10 @@
 # v2.5 allocator-diagnostics experiment
 
+The development candidate is `2.5.0-experimental.9-dev`; experimental.8 remains
+the latest published prerelease. The [2026-10-20 review record](docs/REVIEW-2026-10-20.md)
+describes the concurrency, allocator-observation, path, and crash-report repairs
+being prepared for the next release.
+
 This branch starts from the published v2.4.2 stable rollback build. It does
 not add SteamMatchmaking hooks and does not weaken either fail-closed VAC
 safeguard.
@@ -17,8 +22,8 @@ implementation of the existing VAC join boundary:
   adaptive recovery-block re-arming after a successful retry;
 - conservative primary-reserve re-arming after sustained recovery;
 - 64-bit diagnostic counters;
-- constant-time shutdown of per-callsite accounting when its fixed table is
-  saturated, while global and sampled diagnostics continue;
+- a per-thread caller cache and bounded lookup of existing sites when the
+  fixed table is saturated, while global sample lifetime totals stay active;
 - higher-level engine attribution for sampled retained allocations;
 - sampled per-heap statistics and heap compatibility reporting;
 - a fixed 256-entry allocation flight recorder;

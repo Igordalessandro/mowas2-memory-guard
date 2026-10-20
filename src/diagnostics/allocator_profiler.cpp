@@ -1,6 +1,7 @@
 #include "diagnostics/allocator_profiler.h"
 
 #include "app/config.h"
+#include "diagnostics/retry_policy.h"
 #include "orchestration/memory_guard.h"
 #include "shared/core/module.h"
 #include "shared/logging/logger.h"
@@ -48,7 +49,7 @@ static thread_local DWORD g_engine_context_rva = 0xFFFFFFFFu;
 static thread_local SIZE_T g_engine_context_size = 0;
 static thread_local HANDLE g_engine_context_heap = nullptr;
 
-__declspec(align(8)) struct CallsiteStat {
+struct alignas(8) CallsiteStat {
     volatile LONG rva;
     volatile LONG64 alloc_calls;
     volatile LONG64 realloc_calls;
@@ -73,9 +74,10 @@ struct SampleEntry {
     DWORD size;
     DWORD alloc_rva;
     DWORD tick;
+    CallsiteStat* origin;
 };
 
-__declspec(align(8)) struct HeapStat {
+struct alignas(8) HeapStat {
     void* volatile handle;
     volatile LONG compatibility;
     volatile LONG sample_live_count;
@@ -95,7 +97,7 @@ enum FlightFlags : DWORD {
     FLIGHT_RECOVERED = 8u,
 };
 
-__declspec(align(8)) struct FlightEvent {
+struct alignas(8) FlightEvent {
     volatile LONG sequence;
     DWORD tick;
     DWORD thread_id;
@@ -107,6 +109,9 @@ __declspec(align(8)) struct FlightEvent {
 };
 
 static CallsiteStat g_callsites[CALLSITE_CAPACITY] = {};
+static thread_local bool g_callsite_cache_valid = false;
+static thread_local DWORD g_cached_callsite_rva = 0;
+static thread_local CallsiteStat* g_cached_callsite = nullptr;
 static SampleEntry g_samples[SAMPLE_CAPACITY] = {};
 static HeapStat g_heaps[HEAP_CAPACITY] = {};
 static FlightEvent g_flight[FLIGHT_CAPACITY] = {};
@@ -115,17 +120,19 @@ static volatile LONG g_flight_sequence = 0;
 static volatile LONG g_sample_entries = 0;
 static volatile LONG g_sample_drops = 0;
 static volatile LONG g_callsites_saturated = 0;
-__declspec(align(8)) static volatile LONG64 g_callsite_drops = 0;
+alignas(8) static volatile LONG64 g_callsite_drops = 0;
 
-__declspec(align(8)) static volatile LONG64 g_heap_alloc_calls = 0;
-__declspec(align(8)) static volatile LONG64 g_heap_realloc_calls = 0;
-__declspec(align(8)) static volatile LONG64 g_heap_free_calls = 0;
+alignas(8) static volatile LONG64 g_heap_alloc_calls = 0;
+alignas(8) static volatile LONG64 g_heap_realloc_calls = 0;
+alignas(8) static volatile LONG64 g_heap_free_calls = 0;
 static volatile LONG g_heap_failures = 0;
-__declspec(align(8)) static volatile LONG64 g_virtual_alloc_calls = 0;
-__declspec(align(8)) static volatile LONG64 g_virtual_free_calls = 0;
+alignas(8) static volatile LONG64 g_virtual_alloc_calls = 0;
+alignas(8) static volatile LONG64 g_virtual_free_calls = 0;
 static volatile LONG g_virtual_failures = 0;
-__declspec(align(8)) static volatile LONG64 g_heap_requested_bytes = 0;
-__declspec(align(8)) static volatile LONG64 g_virtual_requested_bytes = 0;
+static volatile LONG g_virtual_nonmemory_failures = 0;
+alignas(8) static volatile LONG64 g_heap_requested_bytes = 0;
+alignas(8) static volatile LONG64 g_virtual_requested_bytes = 0;
+alignas(8) static volatile LONG64 g_sample_live_bytes = 0;
 
 static __forceinline DWORD caller_rva() {
     const std::uintptr_t caller = reinterpret_cast<std::uintptr_t>(_ReturnAddress());
@@ -233,31 +240,36 @@ static void record_flight_event(SIZE_T size, DWORD caller_rva_value, void* resul
 }
 
 static CallsiteStat* callsite_for(DWORD rva) {
-    // Once the fixed table is full, stop callsite accounting. Continuing to
-    // probe all 1024 slots on every allocation/free caused hundreds of
-    // billions of reads during long matches. Global and sampled counters keep
-    // running, while detailed callsite data remains as the pre-saturation
-    // snapshot.
-    if (InterlockedCompareExchange(&g_callsites_saturated, 0, 0) != 0) {
-        return nullptr;
-    }
+    // Keep frequent sites current even after the fixed table fills. Cache the
+    // hot caller per thread; saturated misses search at most 16 slots instead
+    // of returning stale retained totals or probing 1024 slots per call.
+    if (g_callsite_cache_valid && g_cached_callsite_rva == rva) return g_cached_callsite;
+    const bool saturated = InterlockedCompareExchange(&g_callsites_saturated, 0, 0) != 0;
+    auto remember = [rva](CallsiteStat* site) {
+        g_cached_callsite_rva = rva;
+        g_cached_callsite = site;
+        g_callsite_cache_valid = true;
+        return site;
+    };
 
     // Zero means unused, so keep the out-of-image sentinel but shift a true
     // RVA zero to one (the game has no allocation call at its DOS header).
     LONG key = static_cast<LONG>(rva == 0 ? 1u : rva);
     unsigned index = (rva * 2654435761u) & (CALLSITE_CAPACITY - 1u);
-    for (unsigned probe = 0; probe < CALLSITE_CAPACITY; ++probe) {
+    const unsigned probe_limit = saturated ? 16u : CALLSITE_CAPACITY;
+    for (unsigned probe = 0; probe < probe_limit; ++probe) {
         CallsiteStat& slot = g_callsites[(index + probe) & (CALLSITE_CAPACITY - 1u)];
         LONG observed = slot.rva;
-        if (observed == key) return &slot;
+        if (observed == key) return remember(&slot);
         if (observed == 0) {
+            if (saturated) return remember(nullptr);
             observed = InterlockedCompareExchange(&slot.rva, key, 0);
-            if (observed == 0 || observed == key) return &slot;
+            if (observed == 0 || observed == key) return remember(&slot);
         }
     }
     InterlockedIncrement64(&g_callsite_drops);
     InterlockedExchange(&g_callsites_saturated, 1);
-    return nullptr;
+    return remember(nullptr);
 }
 
 static void record_alloc_site(DWORD rva, SIZE_T size, bool realloc_call) {
@@ -283,6 +295,7 @@ static bool insert_sample(void* pointer, SIZE_T size, DWORD alloc_rva, HANDLE he
     const DWORD origin_rva = g_engine_context_active
         ? alloc_rva : sampled_upstream_rva(alloc_rva);
     const DWORD hash = mix_pointer(pointer);
+    CallsiteStat* const origin_site = callsite_for(origin_rva);
     // The low bits select the 1/SAMPLE_RATE cohort. Use different hash bits
     // for the table index or every sampled pointer clusters into a few slots.
     const unsigned start = (hash / SAMPLE_RATE) & (SAMPLE_CAPACITY - 1u);
@@ -295,6 +308,7 @@ static bool insert_sample(void* pointer, SIZE_T size, DWORD alloc_rva, HANDLE he
             slot.size = size > 0xFFFFFFFFu ? 0xFFFFFFFFu : static_cast<DWORD>(size);
             slot.alloc_rva = origin_rva;
             slot.tick = GetTickCount();
+            slot.origin = origin_site;
             slot.pointer = pointer;
             inserted = true;
             break;
@@ -308,7 +322,8 @@ static bool insert_sample(void* pointer, SIZE_T size, DWORD alloc_rva, HANDLE he
     }
 
     InterlockedIncrement(&g_sample_entries);
-    CallsiteStat* site = callsite_for(origin_rva);
+    InterlockedExchangeAdd64(&g_sample_live_bytes, static_cast<LONG64>(size));
+    CallsiteStat* site = origin_site;
     if (site) {
         InterlockedIncrement(&site->sample_live_count);
         InterlockedExchangeAdd64(&site->sample_live_bytes,
@@ -324,8 +339,8 @@ static bool insert_sample(void* pointer, SIZE_T size, DWORD alloc_rva, HANDLE he
     return true;
 }
 
-static bool remove_sample(void* pointer, DWORD* size, DWORD* alloc_rva, DWORD* lifetime_ms) {
-    if (!should_sample(pointer)) return false;
+static SampleEntry detach_sample(void* pointer) {
+    if (!should_sample(pointer)) return {};
     const DWORD hash = mix_pointer(pointer);
     const unsigned start = (hash / SAMPLE_RATE) & (SAMPLE_CAPACITY - 1u);
     SampleEntry found = {};
@@ -340,37 +355,67 @@ static bool remove_sample(void* pointer, DWORD* size, DWORD* alloc_rva, DWORD* l
             slot.size = 0;
             slot.alloc_rva = 0;
             slot.tick = 0;
+            slot.origin = nullptr;
             break;
         }
     }
     unlock_samples();
+    return found;
+}
 
-    if (!found.pointer) return false;
+static void retire_sample(const SampleEntry& found, bool freed = true) {
+    if (!found.pointer) return;
     InterlockedDecrement(&g_sample_entries);
-    if (size) *size = found.size;
-    if (alloc_rva) *alloc_rva = found.alloc_rva;
-    if (lifetime_ms) *lifetime_ms = GetTickCount() - found.tick;
+    InterlockedExchangeAdd64(&g_sample_live_bytes, -static_cast<LONG64>(found.size));
+    const DWORD lifetime_ms = GetTickCount() - found.tick;
 
-    CallsiteStat* origin = callsite_for(found.alloc_rva);
+    // Retain the original site pointer so freeing a sampled block still
+    // removes its live bytes after call-site registration has saturated.
+    CallsiteStat* origin = found.origin;
     if (origin) {
         InterlockedDecrement(&origin->sample_live_count);
         InterlockedExchangeAdd64(&origin->sample_live_bytes,
                                  -static_cast<LONG64>(found.size));
-        InterlockedIncrement(&origin->sample_free_count);
-        InterlockedExchangeAdd64(&origin->sample_freed_bytes, found.size);
-        InterlockedExchangeAdd64(&origin->sample_lifetime_ms,
-                                 lifetime_ms ? *lifetime_ms : 0);
+        if (freed) {
+            InterlockedIncrement(&origin->sample_free_count);
+            InterlockedExchangeAdd64(&origin->sample_freed_bytes, found.size);
+            InterlockedExchangeAdd64(&origin->sample_lifetime_ms, lifetime_ms);
+        }
     }
     HeapStat* heap_stat = heap_stat_for(found.heap);
     if (heap_stat) {
-        InterlockedIncrement64(&heap_stat->sample_free_count);
         InterlockedDecrement(&heap_stat->sample_live_count);
         InterlockedExchangeAdd64(&heap_stat->sample_live_bytes,
                                  -static_cast<LONG64>(found.size));
-        InterlockedExchangeAdd64(&heap_stat->sample_freed_bytes,
-                                 static_cast<LONG64>(found.size));
+        if (freed) {
+            InterlockedIncrement64(&heap_stat->sample_free_count);
+            InterlockedExchangeAdd64(&heap_stat->sample_freed_bytes,
+                                     static_cast<LONG64>(found.size));
+        }
     }
-    return true;
+}
+
+static void restore_sample(const SampleEntry& entry) {
+    if (!entry.pointer) return;
+    const unsigned start = (mix_pointer(entry.pointer) / SAMPLE_RATE) &
+                           (SAMPLE_CAPACITY - 1u);
+    bool restored = false;
+    lock_samples();
+    for (unsigned probe = 0; probe < SAMPLE_PROBES; ++probe) {
+        SampleEntry& slot = g_samples[(start + probe) & (SAMPLE_CAPACITY - 1u)];
+        if (!slot.pointer) {
+            slot = entry;
+            restored = true;
+            break;
+        }
+    }
+    unlock_samples();
+    if (!restored) {
+        // A failed native free/realloc leaves the allocation alive. If other
+        // threads filled the sample bucket, drop only our diagnostic record.
+        retire_sample(entry, false);
+        InterlockedIncrement(&g_sample_drops);
+    }
 }
 
 static void log_low_level_failure(const char* api, SIZE_T size, DWORD rva,
@@ -396,6 +441,7 @@ static void log_low_level_failure(const char* api, SIZE_T size, DWORD rva,
 }
 
 static LPVOID WINAPI profiled_heap_alloc(HANDLE heap, DWORD flags, SIZE_T size) {
+    const DWORD incoming_error = GetLastError();
     const DWORD direct_rva = caller_rva();
     const DWORD rva = g_engine_context_active ? g_engine_context_rva : direct_rva;
     if (g_engine_context_active) g_engine_context_heap = heap;
@@ -403,7 +449,9 @@ static LPVOID WINAPI profiled_heap_alloc(HANDLE heap, DWORD flags, SIZE_T size) 
     InterlockedExchangeAdd64(&g_heap_requested_bytes, static_cast<LONG64>(size));
     record_alloc_site(rva, size, false);
 
+    SetLastError(incoming_error);
     LPVOID result = g_originalHeapAlloc(heap, flags, size);
+    DWORD native_error = GetLastError();
     if (!result) {
         SIZE_T released_bytes = 0;
         unsigned retry_count = 0;
@@ -416,7 +464,9 @@ static LPVOID WINAPI profiled_heap_alloc(HANDLE heap, DWORD flags, SIZE_T size) 
             recovery_stage_released =
                 recovery_stage_released || released.recovery_stage;
             ++retry_count;
+            SetLastError(incoming_error);
             result = g_originalHeapAlloc(heap, flags, size);
+            native_error = GetLastError();
             if (result) break;
         }
         record_flight_event(size, rva, result, heap,
@@ -429,11 +479,13 @@ static LPVOID WINAPI profiled_heap_alloc(HANDLE heap, DWORD flags, SIZE_T size) 
         }
     }
     if (result) insert_sample(result, size, rva, heap);
+    SetLastError(native_error);
     return result;
 }
 
 static LPVOID WINAPI profiled_heap_realloc(HANDLE heap, DWORD flags,
                                            LPVOID pointer, SIZE_T size) {
+    const DWORD incoming_error = GetLastError();
     const DWORD direct_rva = caller_rva();
     const DWORD rva = g_engine_context_active ? g_engine_context_rva : direct_rva;
     if (g_engine_context_active) g_engine_context_heap = heap;
@@ -441,7 +493,12 @@ static LPVOID WINAPI profiled_heap_realloc(HANDLE heap, DWORD flags,
     InterlockedExchangeAdd64(&g_heap_requested_bytes, static_cast<LONG64>(size));
     record_alloc_site(rva, size, true);
 
+    // Remove the old identity before the heap can reuse its address. Keep the
+    // record private until the native result tells us to retire or restore it.
+    const SampleEntry previous_sample = detach_sample(pointer);
+    SetLastError(incoming_error);
     LPVOID result = g_originalHeapReAlloc(heap, flags, pointer, size);
+    DWORD native_error = GetLastError();
     if (!result) {
         SIZE_T released_bytes = 0;
         unsigned retry_count = 0;
@@ -454,7 +511,9 @@ static LPVOID WINAPI profiled_heap_realloc(HANDLE heap, DWORD flags,
             recovery_stage_released =
                 recovery_stage_released || released.recovery_stage;
             ++retry_count;
+            SetLastError(incoming_error);
             result = g_originalHeapReAlloc(heap, flags, pointer, size);
+            native_error = GetLastError();
             if (result) break;
         }
         record_flight_event(size, rva, result, heap,
@@ -467,38 +526,55 @@ static LPVOID WINAPI profiled_heap_realloc(HANDLE heap, DWORD flags,
         }
     }
     if (result) {
-        remove_sample(pointer, nullptr, nullptr, nullptr);
+        retire_sample(previous_sample);
         insert_sample(result, size, rva, heap);
+    } else {
+        restore_sample(previous_sample);
     }
+    SetLastError(native_error);
     return result;
 }
 
 static BOOL WINAPI profiled_heap_free(HANDLE heap, DWORD flags, LPVOID pointer) {
+    const DWORD incoming_error = GetLastError();
     const DWORD rva = caller_rva();
     InterlockedIncrement64(&g_heap_free_calls);
     const DWORD sampled_free_rva = should_sample(pointer)
         ? sampled_upstream_rva(rva) : 0;
+    const SampleEntry previous_sample = detach_sample(pointer);
+    SetLastError(incoming_error);
     const BOOL result = g_originalHeapFree(heap, flags, pointer);
+    const DWORD native_error = GetLastError();
     if (result) {
         if (sampled_free_rva) record_free_site(sampled_free_rva);
-        remove_sample(pointer, nullptr, nullptr, nullptr);
+        retire_sample(previous_sample);
+    } else {
+        restore_sample(previous_sample);
     }
+    SetLastError(native_error);
     return result;
 }
 
 static LPVOID WINAPI profiled_virtual_alloc(LPVOID address, SIZE_T size,
                                             DWORD allocation_type, DWORD protect) {
+    const DWORD incoming_error = GetLastError();
     const DWORD rva = caller_rva();
     InterlockedIncrement64(&g_virtual_alloc_calls);
     InterlockedExchangeAdd64(&g_virtual_requested_bytes, static_cast<LONG64>(size));
 
+    SetLastError(incoming_error);
     LPVOID result = g_originalVirtualAlloc(address, size, allocation_type, protect);
-    if (!result && size != 0) {
-        const DWORD original_error = GetLastError();
+    DWORD native_error = GetLastError();
+    // A reserve can help only some failures, but all resource-exhaustion
+    // errors belong in the crash evidence, including commit-limit failures.
+    if (!result && is_resource_exhaustion_error(native_error)) {
+        const DWORD original_error = native_error;
         SIZE_T released_bytes = 0;
         unsigned retry_count = 0;
         bool recovery_stage_released = false;
-        for (;;) {
+        while (may_retry_virtual_allocation(
+            reinterpret_cast<std::uintptr_t>(address), size,
+            allocation_type, native_error)) {
             const memory_guard::ReleasedReserve released =
                 memory_guard::release_after_failure();
             if (released.bytes == 0) break;
@@ -506,7 +582,9 @@ static LPVOID WINAPI profiled_virtual_alloc(LPVOID address, SIZE_T size,
             recovery_stage_released =
                 recovery_stage_released || released.recovery_stage;
             ++retry_count;
+            SetLastError(incoming_error);
             result = g_originalVirtualAlloc(address, size, allocation_type, protect);
+            native_error = GetLastError();
             if (result) break;
         }
         InterlockedIncrement(&g_virtual_failures);
@@ -534,8 +612,17 @@ static LPVOID WINAPI profiled_virtual_alloc(LPVOID address, SIZE_T size,
         if (result && recovery_stage_released) {
             memory_guard::rearm_recovery_if_needed();
         }
-        if (!result) SetLastError(original_error);
+    } else if (!result) {
+        InterlockedIncrement(&g_virtual_failures);
+        const LONG count = InterlockedIncrement(&g_virtual_nonmemory_failures);
+        if (count <= 4) {
+            logger::log(
+                "VIRTUAL FAILURE : no VA recovery applicable size=%zu type=0x%08lX error=%lu (first four only)",
+                size, static_cast<unsigned long>(allocation_type),
+                static_cast<unsigned long>(native_error));
+        }
     }
+    SetLastError(native_error);
     return result;
 }
 
@@ -579,7 +666,8 @@ static void restore_slot(IatPatch& patch) {
     DWORD ignored = 0;
     VirtualProtect(&patch.slot->u1.Function, sizeof(DWORD), old_protection, &ignored);
     FlushInstructionCache(GetCurrentProcess(), &patch.slot->u1.Function, sizeof(DWORD));
-    *patch.original = nullptr;
+    // A thread can already be executing the wrapper when the IAT is restored.
+    // Its resolved native function must remain callable after rollback.
 }
 
 static bool find_iat_slots(std::uintptr_t base, IatPatch* patches, unsigned count) {
@@ -753,10 +841,9 @@ void log_flight_recorder() {
 }
 
 void log_summary(bool detailed) {
-    LONG64 sampled_live = 0;
-    for (unsigned i = 0; i < CALLSITE_CAPACITY; ++i) {
-        if (g_callsites[i].rva != 0) sampled_live += load64(&g_callsites[i].sample_live_bytes);
-    }
+    // Global sample lifetime accounting continues after site-table saturation;
+    // summing the partial per-site table used to freeze/misstate this estimate.
+    const LONG64 sampled_live = load64(&g_sample_live_bytes);
     const unsigned long long estimated_live = sampled_live > 0
         ? static_cast<unsigned long long>(sampled_live) * SAMPLE_RATE : 0ull;
 

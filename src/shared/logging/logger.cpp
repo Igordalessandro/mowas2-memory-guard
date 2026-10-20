@@ -1,4 +1,5 @@
 #include "shared/logging/logger.h"
+#include "shared/logging/compact_report.h"
 #include "app/config.h"
 
 #include <windows.h>
@@ -6,11 +7,13 @@
 #include <cstdarg>
 #include <cstring>
 #include <cwchar>
+#include <cstdint>
 
 namespace logger {
 
 static HANDLE g_logFile = INVALID_HANDLE_VALUE;
 static HANDLE g_reportFile = INVALID_HANDLE_VALUE;
+static HANDLE g_emergencyFile = INVALID_HANDLE_VALUE;
 static CRITICAL_SECTION g_logLock;
 static constexpr LONG INIT_PENDING = 0;
 static constexpr LONG INIT_BUSY    = 1;
@@ -27,37 +30,17 @@ static char g_reportEvent[128] = {"event=startup"};
 static char g_reportFailure[144] = {"failure=none_observed"};
 static char g_reportCrash[160] = {"crash=not_captured_or_session_still_running"};
 
-static void append_report_line(char* output, size_t capacity,
-                               size_t* used, const char* line) {
-    if (!output || !used || !line || !line[0] || *used >= capacity) return;
-    const size_t remaining = capacity - *used;
-    int written = snprintf(output + *used, remaining + 1, "%s\r\n", line);
-    if (written < 0) return;
-    if (static_cast<size_t>(written) > remaining) {
-        *used = capacity;
-        output[capacity] = '\0';
-    } else {
-        *used += static_cast<size_t>(written);
-    }
-}
-
 static void rewrite_compact_report_locked() {
     if (g_reportFile == INVALID_HANDLE_VALUE) return;
 
     char output[CRASH_REPORT_MAX_BYTES + 1] = {};
-    size_t used = 0;
-    append_report_line(output, CRASH_REPORT_MAX_BYTES, &used,
-                       "DLL Crash Report | paste this entire file into one Steam comment");
-    append_report_line(output, CRASH_REPORT_MAX_BYTES, &used, g_reportSession);
-    append_report_line(output, CRASH_REPORT_MAX_BYTES, &used, g_reportConfig);
-    append_report_line(output, CRASH_REPORT_MAX_BYTES, &used, g_reportCrash);
-    append_report_line(output, CRASH_REPORT_MAX_BYTES, &used, g_reportFailure);
-    append_report_line(output, CRASH_REPORT_MAX_BYTES, &used, g_reportEvent);
-    append_report_line(output, CRASH_REPORT_MAX_BYTES, &used, g_reportMemory);
-    append_report_line(output, CRASH_REPORT_MAX_BYTES, &used, g_reportAllocator);
-    append_report_line(output, CRASH_REPORT_MAX_BYTES, &used, g_reportHotspot);
-    append_report_line(output, CRASH_REPORT_MAX_BYTES, &used,
-                       "Also state: active mods, last action, dialog text or silent desktop crash.");
+    static_assert(CRASH_REPORT_MAX_BYTES == compact_report::max_bytes,
+                  "Keep the portable formatter and Steam report limit synchronized");
+    const compact_report::Fields fields = {
+        g_reportSession, g_reportCrash, g_reportFailure, g_reportMemory,
+        g_reportConfig, g_reportAllocator, g_reportHotspot, g_reportEvent
+    };
+    const size_t used = compact_report::build(output, sizeof(output), fields);
 
     SetFilePointer(g_reportFile, 0, nullptr, FILE_BEGIN);
     DWORD written = 0;
@@ -203,6 +186,32 @@ static DWORD WINAPI flush_thread(LPVOID) {
     }
 }
 
+static HANDLE open_preserved_report(const wchar_t* directory, const wchar_t* name,
+                                     const wchar_t* previous_name, DWORD* error) {
+    wchar_t path[MAX_PATH] = {};
+    wchar_t previous_path[MAX_PATH] = {};
+    if (_snwprintf_s(path, MAX_PATH, _TRUNCATE, L"%s\\%s", directory, name) < 0 ||
+        _snwprintf_s(previous_path, MAX_PATH, _TRUNCATE, L"%s\\%s", directory,
+                     previous_name) < 0) {
+        *error = ERROR_FILENAME_EXCED_RANGE;
+        return INVALID_HANDLE_VALUE;
+    }
+    // Keep exactly one prior session. A failed backup must not destroy the
+    // original report: detailed per-session logging can still proceed.
+    if (!CopyFileW(path, previous_path, FALSE)) {
+        const DWORD backup_error = GetLastError();
+        if (backup_error != ERROR_FILE_NOT_FOUND && backup_error != ERROR_PATH_NOT_FOUND) {
+            *error = backup_error;
+            return INVALID_HANDLE_VALUE;
+        }
+    }
+    HANDLE file = CreateFileW(path, GENERIC_WRITE,
+                              FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                              nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    *error = file == INVALID_HANDLE_VALUE ? GetLastError() : ERROR_SUCCESS;
+    return file;
+}
+
 bool init() {
     LONG prev = InterlockedCompareExchange(&g_initState, INIT_BUSY, INIT_PENDING);
     if (prev != INIT_PENDING) {
@@ -259,20 +268,14 @@ bool init() {
         return false;
     }
 
-    wchar_t reportPath[MAX_PATH] = {0};
-    _snwprintf_s(reportPath, MAX_PATH, _TRUNCATE,
-                 L"%s\\%s", dllDir, CRASH_REPORT_FILE_NAME);
-    g_reportFile = CreateFileW(
-        reportPath,
-        GENERIC_WRITE,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-        nullptr,
-        CREATE_ALWAYS,
-        FILE_ATTRIBUTE_NORMAL,
-        nullptr
-    );
-    const DWORD report_create_error = g_reportFile == INVALID_HANDLE_VALUE
-        ? GetLastError() : ERROR_SUCCESS;
+    DWORD report_create_error = ERROR_SUCCESS;
+    g_reportFile = open_preserved_report(dllDir, CRASH_REPORT_FILE_NAME,
+                                         L"DLL Crash Report.previous.txt",
+                                         &report_create_error);
+    DWORD emergency_create_error = ERROR_SUCCESS;
+    g_emergencyFile = open_preserved_report(dllDir, L"DLL Emergency Crash.txt",
+                                            L"DLL Emergency Crash.previous.txt",
+                                            &emergency_create_error);
     initialize_report_header();
 
     InterlockedExchange(&g_initState, INIT_DONE);
@@ -290,6 +293,9 @@ bool init() {
         CRASH_REPORT_FILE_NAME, CRASH_REPORT_MAX_BYTES);
     if (g_reportFile == INVALID_HANDLE_VALUE) {
         log("Compact report creation failed err=%lu", report_create_error);
+    }
+    if (g_emergencyFile == INVALID_HANDLE_VALUE) {
+        log("Emergency report creation failed err=%lu", emergency_create_error);
     }
     log("============================================================");
 
@@ -389,6 +395,53 @@ void flush_now() {
         FlushFileBuffers(g_reportFile);
     }
     LeaveCriticalSection(&g_logLock);
+}
+
+bool try_begin_crash_report() {
+    return g_initState == INIT_DONE && TryEnterCriticalSection(&g_logLock) != FALSE;
+}
+
+void end_crash_report() {
+    LeaveCriticalSection(&g_logLock);
+}
+
+void write_emergency_crash(unsigned long code, const void* address,
+                           unsigned long thread, unsigned long instruction,
+                           unsigned long stack) {
+    if (g_initState != INIT_DONE || g_emergencyFile == INVALID_HANDLE_VALUE) return;
+    char output[384] = {};
+    size_t used = 0;
+    auto append = [&](const char* text) {
+        while (*text && used + 1 < sizeof(output)) output[used++] = *text++;
+    };
+    auto number = [&](std::uint64_t value, unsigned base) {
+        char digits[32] = {};
+        size_t count = 0;
+        do {
+            digits[count++] = "0123456789ABCDEF"[value % base];
+            value /= base;
+        } while (value && count < sizeof(digits));
+        while (count && used + 1 < sizeof(output)) output[used++] = digits[--count];
+    };
+    // Avoid CRT formatting here: an exception may be caused by a damaged heap.
+    append("DLL Emergency Crash Report\r\nversion=" MEMORY_GUARD_VERSION " pid=");
+    number(GetCurrentProcessId(), 10);
+    append("\r\ncrash=unhandled code=0x");
+    number(code, 16);
+    append(" address=0x");
+    number(reinterpret_cast<std::uintptr_t>(address), 16);
+    append(" thread=");
+    number(thread, 10);
+    append(" ip=0x");
+    number(instruction, 16);
+    append(" sp=0x");
+    number(stack, 16);
+    append("\r\ncapture=minimum; see DLL Crash Report.txt for session state\r\n");
+    // This handle is never used by ordinary logging or its flushing thread.
+    // Do not seek, allocate, or acquire the potentially damaged logger lock.
+    DWORD written = 0;
+    WriteFile(g_emergencyFile, output, static_cast<DWORD>(used), &written, nullptr);
+    FlushFileBuffers(g_emergencyFile);
 }
 
 }  // namespace logger

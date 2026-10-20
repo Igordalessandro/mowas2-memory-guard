@@ -73,6 +73,35 @@ static bool is_extended_or_device(const wchar_t* path) {
            (path[2] == L'?' || path[2] == L'.') && is_separator(path[3]);
 }
 
+// Every wrapper must restore the native API's error after path cleanup and
+// logging. CreateFile also returns meaningful errors on success (for example
+// ERROR_ALREADY_EXISTS for OPEN_ALWAYS), so preserve the value unconditionally.
+struct LastErrorScope {
+    DWORD value = GetLastError();
+    ~LastErrorScope() { SetLastError(value); }
+};
+
+template <typename Char>
+static bool may_need_extended_path(const Char* path, std::size_t length) {
+    if (!path || length == 0 || length > MAX_EXTENDED_PATH_CHARS) return false;
+    if (length >= LONG_PATH_TRIGGER) return true;
+
+    const auto separator = [](Char value) {
+        return value == static_cast<Char>('\\') || value == static_cast<Char>('/');
+    };
+    // Ordinary short absolute paths stay allocation-free and do not query the
+    // current directory. A relative input can be short while its resolved path
+    // exceeds MAX_PATH, particularly in deep Steam library directories.
+    if ((length >= 3 && path[1] == static_cast<Char>(':') && separator(path[2])) ||
+        (length >= 2 && separator(path[0]) && separator(path[1]))) {
+        return false;
+    }
+    const DWORD cwd_required = GetCurrentDirectoryW(0, nullptr);
+    // cwd_required includes its terminator, which accounts for a joining slash.
+    return cwd_required != 0 &&
+           static_cast<std::size_t>(cwd_required) + length >= LONG_PATH_TRIGGER;
+}
+
 struct WidePath {
     wchar_t* owned = nullptr;
     const wchar_t* value = nullptr;
@@ -146,7 +175,32 @@ static bool make_absolute(wchar_t** path, std::size_t* length) {
         return false;
     }
 
-    const std::size_t prefix_length = root_relative ? 2u : cwd_length;
+    std::size_t prefix_length = cwd_length;
+    if (root_relative) {
+        if (is_drive_absolute(cwd)) {
+            prefix_length = 2;  // Drive root, without the joining slash.
+        } else if (is_unc(cwd)) {
+            // A UNC root includes both the server and share. Retaining only
+            // the first two slashes would turn \mods\x into a malformed UNC.
+            std::size_t read = 2;
+            while (read < cwd_length && !is_separator(cwd[read])) ++read;
+            if (read == 2 || read >= cwd_length) {
+                release_bytes(cwd);
+                return false;
+            }
+            while (read < cwd_length && is_separator(cwd[read])) ++read;
+            const std::size_t share_start = read;
+            while (read < cwd_length && !is_separator(cwd[read])) ++read;
+            if (read == share_start) {
+                release_bytes(cwd);
+                return false;
+            }
+            prefix_length = read;
+        } else {
+            release_bytes(cwd);
+            return false;
+        }
+    }
     const bool separator_needed = !root_relative &&
         prefix_length > 0 && !is_separator(cwd[prefix_length - 1]);
     const std::size_t combined_length = prefix_length +
@@ -252,7 +306,7 @@ static WidePath prepare_wide_path(const wchar_t* input, bool force = false) {
     result.original_length = bounded_length(input);
     if (!input || result.original_length == 0 ||
         result.original_length > MAX_EXTENDED_PATH_CHARS ||
-        (!force && result.original_length < LONG_PATH_TRIGGER) ||
+        (!force && !may_need_extended_path(input, result.original_length)) ||
         is_extended_or_device(input)) {
         return result;
     }
@@ -279,7 +333,7 @@ static AnsiPath prepare_ansi_path(const char* input) {
     result.original_length = bounded_length(input);
     if (!input || result.original_length == 0 ||
         result.original_length > MAX_EXTENDED_PATH_CHARS ||
-        result.original_length < LONG_PATH_TRIGGER) {
+        !may_need_extended_path(input, result.original_length)) {
         return result;
     }
 
@@ -322,17 +376,25 @@ static AnsiPath prepare_ansi_path(const char* input) {
 
 static void record_result(const char* api, std::size_t length, bool rewritten,
                           bool succeeded, DWORD error) {
-    if (length < LONG_PATH_TRIGGER) return;
+    if (length < LONG_PATH_TRIGGER && !rewritten) return;
     if (rewritten) InterlockedIncrement(&g_rewrites);
-    if (!succeeded) InterlockedIncrement(&g_failures);
+    const LONG failures = succeeded ? InterlockedCompareExchange(&g_failures, 0, 0)
+                                    : InterlockedIncrement(&g_failures);
 
     const LONG event_number = InterlockedIncrement(&g_reported);
-    if (event_number <= 32 || !succeeded) {
+    // Missing-file/wildcard probes are often routine. Keep early examples and
+    // aggregate counts without turning a repeated missing resource into disk IO
+    // on every call. Unsigned arithmetic also avoids overflow in the sampler.
+    const auto failure_count = static_cast<unsigned long>(failures);
+    const bool sampled_failure = !succeeded &&
+        (failure_count <= 8 || (failure_count & (failure_count - 1)) == 0 ||
+         (failure_count & 255u) == 0);
+    if (event_number <= 32 || sampled_failure) {
         logger::log(
             "LONG PATH : api=%s chars=%zu rewritten=%s result=%s error=%lu total_rewrites=%ld failures=%ld",
             api, length, rewritten ? "yes" : "no", succeeded ? "ok" : "failed",
             static_cast<unsigned long>(error), static_cast<long>(g_rewrites),
-            static_cast<long>(g_failures));
+            static_cast<long>(failures));
     }
     if (rewritten && event_number == 1) {
         logger::report_event("event=long_path api=%s chars=%zu action=extended_prefix", api,
@@ -343,81 +405,88 @@ static void record_result(const char* api, std::size_t length, bool rewritten,
 static HANDLE WINAPI guarded_create_file_a(
     LPCSTR path, DWORD access, DWORD sharing, LPSECURITY_ATTRIBUTES security,
     DWORD creation, DWORD flags, HANDLE template_file) {
+    LastErrorScope native_error;
     AnsiPath prepared = prepare_ansi_path(path);
+    SetLastError(native_error.value);
     HANDLE result = g_create_file_a(prepared.value, access, sharing, security,
                                     creation, flags, template_file);
-    const DWORD error = result == INVALID_HANDLE_VALUE ? GetLastError() : ERROR_SUCCESS;
+    native_error.value = GetLastError();
     record_result("CreateFileA", prepared.original_length, prepared.rewritten,
-                  result != INVALID_HANDLE_VALUE, error);
-    if (result == INVALID_HANDLE_VALUE) SetLastError(error);
+                  result != INVALID_HANDLE_VALUE, native_error.value);
     return result;
 }
 
 static HANDLE WINAPI guarded_create_file_w(
     LPCWSTR path, DWORD access, DWORD sharing, LPSECURITY_ATTRIBUTES security,
     DWORD creation, DWORD flags, HANDLE template_file) {
+    LastErrorScope native_error;
     WidePath prepared = prepare_wide_path(path);
+    SetLastError(native_error.value);
     HANDLE result = g_create_file_w(prepared.value, access, sharing, security,
                                     creation, flags, template_file);
-    const DWORD error = result == INVALID_HANDLE_VALUE ? GetLastError() : ERROR_SUCCESS;
+    native_error.value = GetLastError();
     record_result("CreateFileW", prepared.original_length, prepared.rewritten,
-                  result != INVALID_HANDLE_VALUE, error);
-    if (result == INVALID_HANDLE_VALUE) SetLastError(error);
+                  result != INVALID_HANDLE_VALUE, native_error.value);
     return result;
 }
 
 static HANDLE WINAPI guarded_find_first_file_w(LPCWSTR path, LPWIN32_FIND_DATAW data) {
+    LastErrorScope native_error;
     WidePath prepared = prepare_wide_path(path);
+    SetLastError(native_error.value);
     HANDLE result = g_find_first_file_w(prepared.value, data);
-    const DWORD error = result == INVALID_HANDLE_VALUE ? GetLastError() : ERROR_SUCCESS;
+    native_error.value = GetLastError();
     record_result("FindFirstFileW", prepared.original_length, prepared.rewritten,
-                  result != INVALID_HANDLE_VALUE, error);
-    if (result == INVALID_HANDLE_VALUE) SetLastError(error);
+                  result != INVALID_HANDLE_VALUE, native_error.value);
     return result;
 }
 
 static HANDLE WINAPI guarded_find_first_file_ex_a(
     LPCSTR path, FINDEX_INFO_LEVELS level, LPVOID data, FINDEX_SEARCH_OPS search,
     LPVOID filter, DWORD flags) {
+    LastErrorScope native_error;
     AnsiPath prepared = prepare_ansi_path(path);
+    SetLastError(native_error.value);
     HANDLE result = g_find_first_file_ex_a(prepared.value, level, data, search, filter, flags);
-    const DWORD error = result == INVALID_HANDLE_VALUE ? GetLastError() : ERROR_SUCCESS;
+    native_error.value = GetLastError();
     record_result("FindFirstFileExA", prepared.original_length, prepared.rewritten,
-                  result != INVALID_HANDLE_VALUE, error);
-    if (result == INVALID_HANDLE_VALUE) SetLastError(error);
+                  result != INVALID_HANDLE_VALUE, native_error.value);
     return result;
 }
 
 static HANDLE WINAPI guarded_find_first_file_ex_w(
     LPCWSTR path, FINDEX_INFO_LEVELS level, LPVOID data, FINDEX_SEARCH_OPS search,
     LPVOID filter, DWORD flags) {
+    LastErrorScope native_error;
     WidePath prepared = prepare_wide_path(path);
+    SetLastError(native_error.value);
     HANDLE result = g_find_first_file_ex_w(prepared.value, level, data, search, filter, flags);
-    const DWORD error = result == INVALID_HANDLE_VALUE ? GetLastError() : ERROR_SUCCESS;
+    native_error.value = GetLastError();
     record_result("FindFirstFileExW", prepared.original_length, prepared.rewritten,
-                  result != INVALID_HANDLE_VALUE, error);
-    if (result == INVALID_HANDLE_VALUE) SetLastError(error);
+                  result != INVALID_HANDLE_VALUE, native_error.value);
     return result;
 }
 
 static DWORD WINAPI guarded_get_file_attributes_w(LPCWSTR path) {
+    LastErrorScope native_error;
     WidePath prepared = prepare_wide_path(path);
+    SetLastError(native_error.value);
     const DWORD result = g_get_file_attributes_w(prepared.value);
-    const DWORD error = result == INVALID_FILE_ATTRIBUTES ? GetLastError() : ERROR_SUCCESS;
+    native_error.value = GetLastError();
     record_result("GetFileAttributesW", prepared.original_length, prepared.rewritten,
-                  result != INVALID_FILE_ATTRIBUTES, error);
-    if (result == INVALID_FILE_ATTRIBUTES) SetLastError(error);
+                  result != INVALID_FILE_ATTRIBUTES, native_error.value);
     return result;
 }
 
 static BOOL WINAPI guarded_get_file_attributes_ex_w(
     LPCWSTR path, GET_FILEEX_INFO_LEVELS level, LPVOID info) {
+    LastErrorScope native_error;
     WidePath prepared = prepare_wide_path(path);
+    SetLastError(native_error.value);
     const BOOL result = g_get_file_attributes_ex_w(prepared.value, level, info);
-    const DWORD error = result ? ERROR_SUCCESS : GetLastError();
+    native_error.value = GetLastError();
     record_result("GetFileAttributesExW", prepared.original_length, prepared.rewritten,
-                  result != FALSE, error);
-    if (!result) SetLastError(error);
+                  result != FALSE, native_error.value);
     return result;
 }
 
@@ -494,7 +563,8 @@ static void restore_slot(IatPatch& patch) {
     DWORD ignored = 0;
     VirtualProtect(&patch.slot->u1.Function, sizeof(DWORD), old_protection, &ignored);
     FlushInstructionCache(GetCurrentProcess(), &patch.slot->u1.Function, sizeof(DWORD));
-    *patch.original = nullptr;
+    // A thread may already have entered the wrapper before this slot was
+    // restored. Its resolved original must remain valid for that in-flight call.
 }
 
 static bool install(std::uintptr_t game_base) {

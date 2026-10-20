@@ -5,6 +5,7 @@
 // %TEMP% and LoadLibrary that copy.
 
 #include "shared/logging/logger.h"
+#include "app/dbghelp_proxy.h"
 
 // windows.h may declare the system ImageNtHeader import.  Rename that
 // declaration in this translation unit because this file defines the proxy
@@ -13,6 +14,7 @@
 #include <windows.h>
 #undef ImageNtHeader
 #include <cstdio>
+#include <cstring>
 #include <cwchar>
 
 #if defined(_MSC_VER) && !defined(__MINGW32__)
@@ -44,6 +46,49 @@ static void fail_init(bool permanent) {
     LONG fails = InterlockedIncrement(&g_initFailures);
     InterlockedExchange(&g_initOnce,
         (permanent || fails >= INIT_MAX_RETRIES) ? STATE_PERMANENT_FAIL : STATE_PENDING);
+}
+
+// A mapped copy can legitimately prevent CopyFile from overwriting it. Only
+// reuse that copy if it still matches this installation's system DLL. Compare
+// sequentially with a fixed 8 KiB stack budget; no allocation is needed here.
+static bool same_file_contents(const wchar_t* source, const wchar_t* candidate) {
+    struct ReadHandle {
+        HANDLE value;
+        ~ReadHandle() { if (value != INVALID_HANDLE_VALUE) CloseHandle(value); }
+    };
+    // Deny writers while comparing. An unreadable or concurrently writable
+    // copy is not evidence that the existing file is safe to reuse.
+    ReadHandle original{CreateFileW(source, GENERIC_READ, FILE_SHARE_READ,
+                                    nullptr, OPEN_EXISTING,
+                                    FILE_FLAG_SEQUENTIAL_SCAN, nullptr)};
+    if (original.value == INVALID_HANDLE_VALUE) return false;
+    ReadHandle copy{CreateFileW(candidate, GENERIC_READ, FILE_SHARE_READ,
+                                nullptr, OPEN_EXISTING,
+                                FILE_FLAG_SEQUENTIAL_SCAN, nullptr)};
+    if (copy.value == INVALID_HANDLE_VALUE) return false;
+    LARGE_INTEGER source_size = {};
+    LARGE_INTEGER copy_size = {};
+    constexpr LONGLONG MAX_COPY_BYTES = 64LL * 1024LL * 1024LL;
+    if (!GetFileSizeEx(original.value, &source_size) ||
+        !GetFileSizeEx(copy.value, &copy_size) || source_size.QuadPart <= 0 ||
+        source_size.QuadPart > MAX_COPY_BYTES ||
+        source_size.QuadPart != copy_size.QuadPart) return false;
+
+    unsigned char source_bytes[4096];
+    unsigned char copy_bytes[sizeof(source_bytes)];
+    LONGLONG remaining = source_size.QuadPart;
+    while (remaining > 0) {
+        const DWORD requested = remaining < static_cast<LONGLONG>(sizeof(source_bytes))
+            ? static_cast<DWORD>(remaining) : static_cast<DWORD>(sizeof(source_bytes));
+        DWORD source_read = 0;
+        DWORD copy_read = 0;
+        if (!ReadFile(original.value, source_bytes, requested, &source_read, nullptr) ||
+            !ReadFile(copy.value, copy_bytes, requested, &copy_read, nullptr) ||
+            source_read != requested || copy_read != requested ||
+            std::memcmp(source_bytes, copy_bytes, requested) != 0) return false;
+        remaining -= requested;
+    }
+    return true;
 }
 
 // Lazy : DllMain's loader-lock forbids CopyFileW / LoadLibraryW here.
@@ -96,12 +141,18 @@ static void ensure_init() {
     // Ignore FILE_NOT_FOUND on the first run.
     SetFileAttributesW(copyPath, FILE_ATTRIBUTE_NORMAL);
 
-    // SHARING_VIOLATION = previous run still maps the file, OK to reuse.
-    // Anything else : refuse to load a possibly stale/tampered temp file.
+    // A previous process may still map the copy. Reuse only after verifying
+    // its complete contents against the current system DLL.
     bool can_load = true;
     if (!CopyFileW(srcPath, copyPath, FALSE)) {
         DWORD err = GetLastError();
-        if (err != ERROR_SHARING_VIOLATION) {
+        if (err == ERROR_SHARING_VIOLATION) {
+            if (!same_file_contents(srcPath, copyPath)) {
+                logger::log("dbghelp_proxy : locked temp copy differs from system DLL or could not be verified; refusing to LoadLibrary %ws",
+                            copyPath);
+                can_load = false;
+            }
+        } else {
             logger::log("dbghelp_proxy : CopyFile FAILED src=%ws dst=%ws err=%lu — refusing to LoadLibrary stale temp file",
                         srcPath, copyPath, err);
             can_load = false;
@@ -165,10 +216,22 @@ static void ensure_init() {
 
 } // anonymous namespace
 
+bool dbghelp_proxy::prewarm() {
+    ensure_init();
+    return InterlockedCompareExchange(&g_initOnce, 0, 0) == STATE_DONE &&
+           g_pfnImageNtHeader && g_pfnMiniDumpWriteDump;
+}
+
 extern "C" __declspec(dllexport) PIMAGE_NT_HEADERS WINAPI
 ImageNtHeader(PVOID Base) {
+    const DWORD incoming_error = GetLastError();
     ensure_init();
-    if (!g_pfnImageNtHeader) return nullptr;
+    if (InterlockedCompareExchange(&g_initOnce, 0, 0) != STATE_DONE ||
+        !g_pfnImageNtHeader) {
+        SetLastError(ERROR_PROC_NOT_FOUND);
+        return nullptr;
+    }
+    SetLastError(incoming_error);
     return g_pfnImageNtHeader(Base);
 }
 
@@ -176,11 +239,14 @@ extern "C" __declspec(dllexport) BOOL WINAPI
 MiniDumpWriteDump(HANDLE process, DWORD process_id, HANDLE file,
                   DWORD dump_type, PVOID exception_info,
                   PVOID user_stream_info, PVOID callback_info) {
+    const DWORD incoming_error = GetLastError();
     ensure_init();
-    if (!g_pfnMiniDumpWriteDump) {
+    if (InterlockedCompareExchange(&g_initOnce, 0, 0) != STATE_DONE ||
+        !g_pfnMiniDumpWriteDump) {
         SetLastError(ERROR_PROC_NOT_FOUND);
         return FALSE;
     }
+    SetLastError(incoming_error);
     return g_pfnMiniDumpWriteDump(process, process_id, file, dump_type,
                                   exception_info, user_stream_info, callback_info);
 }

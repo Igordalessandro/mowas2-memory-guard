@@ -18,4 +18,13 @@ void report_crash(const char* fmt, ...);
 
 void flush_now();
 
+// Exception handlers must acquire this nonblocking guard before using the
+// regular logger. Its critical section is recursive on the calling thread.
+bool try_begin_crash_report();
+void end_crash_report();
+// Writes only to a separate startup-opened file; never takes the logger lock.
+void write_emergency_crash(unsigned long code, const void* address,
+                           unsigned long thread, unsigned long instruction,
+                           unsigned long stack);
+
 }
