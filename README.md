@@ -1,6 +1,6 @@
 # Men of War: Assault Squad 2 Memory Guard
 
-steam thred for error reporting: https://steamcommunity.com/app/244450/discussions/0/591817814333171584/
+steam threadfor error reporting: https://steamcommunity.com/app/244450/discussions/0/591817814333171584/
 
 An experimental 32-bit proxy DLL for the Steam edition of *Men of War: Assault
 Squad 2*. It mitigates the known 2 GB lobby-allocation crash, keeps emergency
