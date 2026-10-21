@@ -1,15 +1,15 @@
 # Men of War: Assault Squad 2 Memory Guard
 
 > [!IMPORTANT]
-> The `experimental/allocator-diagnostics-v2.5` branch is not the public stable
-> release. Its DLL identifies itself as `2.5.0-experimental.10`. Use the v2.4.2
-> GitHub release for the stable rollback build.
+> This working branch identifies its DLL as `2.5.0-experimental.13`; it is not
+> the public stable release. Use the v2.4.2 GitHub release for stable rollback.
 
-Local development: `experimental/lag-investigation` contains an unreleased
-`2.5.0-experimental.12-dev` lower-overhead diagnostics candidate. See the
+Local development: [experimental.13](docs/EXPERIMENTAL-13.md) carries forward
+all of the unreleased .12 candidate's additions, with lighter request-site
+profiling enabled by default. See the
 [lag and heavy-mod investigation](docs/INVESTIGATION-2026-10-21-Lag-And-Mod-Crashes.md)
-for evidence, testing limits and controlled test instructions. It is not a
-confirmed fix for reload leaks or every heavy-mod out-of-memory crash.
+for evidence and controlled test instructions. It is not a confirmed fix for
+slow motion, reload leaks or every heavy-mod out-of-memory crash.
 
 An experimental 32-bit proxy DLL for the Steam edition of *Men of War: Assault
 Squad 2*. It mitigates the known 2 GB lobby-allocation crash, keeps emergency
