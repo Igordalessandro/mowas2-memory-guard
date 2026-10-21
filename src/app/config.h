@@ -3,7 +3,7 @@
 // Target binary: mowas_2.exe v3.262.1 (Steam Oct 2019).
 #define MOWAS2_PREFERRED_BASE       0x00400000
 
-#define MEMORY_GUARD_VERSION        "2.5.0-experimental.10"
+#define MEMORY_GUARD_VERSION        "2.5.0-experimental.11-dev"
 
 #define OFFSET_ENGINE_ALLOC         0x00809041
 #define OFFSET_ENGINE_ALLOC_CORE    0x0010E4F0

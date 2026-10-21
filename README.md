@@ -151,6 +151,11 @@ does not raise its address-space limit further.
 
 ### VAC safety guards
 
+Local development note: a Proton Steam-text compatibility candidate is being
+tested separately from the published releases. See the
+[investigation and test plan](docs/PROTON-Steam-Text-Investigation.md).
+It does not change the secure host/join safeguards described below.
+
 The game leaves **VAC Secured** checked by default when creating an Internet
 game. Memory Guard intentionally leaves the visible checkbox unchanged, but it
 refuses `SteamGameServer_Init` if the game requests secure server mode. The user
@@ -369,6 +374,11 @@ src/
 ├── diagnostics/
 │   ├── allocator_profiler.h
 │   └── allocator_profiler.cpp # game IAT hooks + bounded call-site sampling
+│
+├── compat/
+│   ├── long_path_guard.cpp
+│   ├── steam_text_guard.cpp  # optional Proton fresh-string bridge workaround
+│   └── stable_steam_text.h   # bounded immutable string storage
 │
 └── orchestration/
     ├── hooks.h
