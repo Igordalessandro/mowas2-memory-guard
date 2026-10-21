@@ -259,6 +259,12 @@ The sections below are for anyone who wants to build the DLL from source, modify
 
 ## Build from source
 
+Repository documentation is indexed in [docs/README.md](docs/README.md).
+Historical release notes are in [docs/releases/](docs/releases/), and versioned
+DLL checksum manifests are in [checksums/](checksums/). The root README and
+LICENSE stay here for GitHub discovery. Published release asset names and
+existing release tags are unchanged.
+
 The original `build.bat` uses MSVC with the x86 C++ workload. This working copy also provides `build-linux.sh`, tested with the i686 target from llvm-mingw.
 
 ### Clone with submodules

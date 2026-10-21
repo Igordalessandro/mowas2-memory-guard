@@ -1,10 +1,13 @@
 # v2.5 allocator-diagnostics experiment
 
-The current prerelease is `2.5.0-experimental.10`. It preserves experimental.9's
-allocation policy and adds exact preflight-release attribution, fresh failure
-snapshots, a separate large-allocation history, and aligned free-hole counts.
-See the [experimental.10 diagnostic guide](docs/EXPERIMENTAL-10-Diagnostics.md)
-and the [experimental.9 review record](docs/REVIEW-2026-10-20.md).
+The current prerelease is `2.5.0-experimental.13`, with full request-site
+profiling, bounded caller caching, VA-scan timing, physical-memory context
+and the optional Proton Steam-text workaround. See the
+[experimental.13 guide](EXPERIMENTAL-13.md) for its exact scope and limitations.
+It preserves the earlier staged recovery, preflight-release attribution,
+fresh failure snapshots, separate large-allocation history and aligned
+free-hole counts. See the [experimental.10 diagnostic guide](EXPERIMENTAL-10-Diagnostics.md)
+and the [experimental.9 review record](REVIEW-2026-10-20.md) for their history.
 
 This branch starts from the published v2.4.2 stable rollback build. It does
 not add SteamMatchmaking hooks and does not weaken either fail-closed VAC

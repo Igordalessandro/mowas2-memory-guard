@@ -1,7 +1,8 @@
 # Experimental.13 — full profiling and expanded diagnostics
 
 Corrected at the user's request on 2026-10-21. Branch:
-`experimental/v2.5.0-experimental.13`. Neither installed game was changed.
+`experimental/v2.5.0-experimental.13`. Building and publishing did not change
+either installed game; the later requested deployment is recorded below.
 Publication was subsequently requested; see the
 [GitHub prerelease](https://github.com/Igordalessandro/mowas2-memory-guard/releases/tag/v2.5.0-experimental.13)
 for live publication status and attached assets. Stable 2.4.2 is unchanged.
@@ -101,5 +102,18 @@ passed seven Linux sanitizer suites and all sixteen regression executables on
 native Windows x86. Both draft assets were downloaded and byte-compared with
 the local DLL/checksum before publication. Published asset digests match the
 corrected full-profiling artifact. The public tag resolves to the tested source
-commit, stable GitHub Latest remains v2.4.2, and neither installed game was
-updated. This publication record is a documentation-only follow-up to the tag.
+commit, stable GitHub Latest remains v2.4.2, and neither installed game had
+been updated at publication. This is a documentation-only follow-up to the tag.
+
+### Subsequent deployment to both PCs
+
+At the user's request on 2026-10-21, the corrected full-profiling .13 DLL was
+installed on the local Proton PC and Tety's native-Windows PC, with both games
+and editors closed. Both installed hashes matched
+`f4d2ebab75e63943a751a9a828f83c6b07c37a3e886cb03df7e08c5445482fcb`.
+Verified .11-dev rollback copies were retained on each PC, matching
+`09ed0886d5898fe90c9eb09a45ced06aab8e9de0b59e16bc0b3858100996bd45`.
+The local native/builtin dbghelp override was preserved. Tety's deployment was
+silent; neither game was launched. Installation verification is not gameplay
+or UI confirmation. No game executable, mod, launch option or VAC policy was
+changed.
