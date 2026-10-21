@@ -4,7 +4,7 @@
 > This working branch identifies its DLL as `2.5.0-experimental.13`; it is not
 > the public stable release. Use the v2.4.2 GitHub release for stable rollback.
 
-Local development: [experimental.13](docs/EXPERIMENTAL-13.md) carries forward
+Prerelease candidate: [experimental.13](docs/EXPERIMENTAL-13.md) carries forward
 the unreleased .12 candidate's diagnostics and caching additions, with full
 per-request site profiling. The light-mode option has been removed. See the
 [lag and heavy-mod investigation](docs/INVESTIGATION-2026-10-21-Lag-And-Mod-Crashes.md)

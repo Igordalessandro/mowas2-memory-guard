@@ -1,8 +1,10 @@
 # Experimental.13 — full profiling and expanded diagnostics
 
 Corrected at the user's request on 2026-10-21. Branch:
-`experimental/v2.5.0-experimental.13`. This is a local build, not yet installed
-on either PC or published on GitHub. Stable 2.4.2 is unchanged.
+`experimental/v2.5.0-experimental.13`. Neither installed game was changed.
+Publication was subsequently requested; see the
+[GitHub prerelease](https://github.com/Igordalessandro/mowas2-memory-guard/releases/tag/v2.5.0-experimental.13)
+for live publication status and attached assets. Stable 2.4.2 is unchanged.
 
 ## Contents
 
@@ -85,6 +87,7 @@ The earlier light-mode artifact (SHA-256
 was preserved at `dist/v2.5.0-experimental.13-light-superseded/dbghelp.dll`.
 It is superseded, not the version to deploy. No public release ever used it.
 
-Native-Windows runtime and real gameplay/slow-motion validation remain
-outstanding. Neither deployment nor GitHub publication is part of preparing
-this local artifact. No live game session was interrupted.
+The above Windows-test executions were local Wine runs; native-Windows
+regression status is recorded in the source CI checks linked from the release.
+Real gameplay/slow-motion validation remains outstanding. Publication does
+not deploy the DLL to either PC. No live game session was interrupted.
