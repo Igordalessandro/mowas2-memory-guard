@@ -91,3 +91,15 @@ The above Windows-test executions were local Wine runs; native-Windows
 regression status is recorded in the source CI checks linked from the release.
 Real gameplay/slow-motion validation remains outstanding. Publication does
 not deploy the DLL to either PC. No live game session was interrupted.
+
+### Verified publication
+
+Published on 2026-10-21 as `v2.5.0-experimental.13`, a non-draft prerelease at
+source commit `2bc2975bb555e572343407d4adf773649a3e5540`. The
+[GitHub regression run](https://github.com/Igordalessandro/mowas2-memory-guard/actions/runs/39560205475)
+passed seven Linux sanitizer suites and all sixteen regression executables on
+native Windows x86. Both draft assets were downloaded and byte-compared with
+the local DLL/checksum before publication. Published asset digests match the
+corrected full-profiling artifact. The public tag resolves to the tested source
+commit, stable GitHub Latest remains v2.4.2, and neither installed game was
+updated. This publication record is a documentation-only follow-up to the tag.
