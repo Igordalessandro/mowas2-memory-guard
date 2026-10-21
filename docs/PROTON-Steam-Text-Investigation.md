@@ -128,9 +128,18 @@ addresses embedded in the shipping installer. Image SHA-256:
 Built candidate: `dist/v2.5.0-experimental.11-dev/dbghelp.dll`, PE32/x86,
 exports only `ImageNtHeader` and `MiniDumpWriteDump`. SHA-256:
 `09ed0886d5898fe90c9eb09a45ced06aab8e9de0b59e16bc0b3858100996bd45`.
-The installed game DLL remains experimental.10; neither PC was updated and no
-GitHub release was created during this investigation. Live UI verification
-and a controlled comparison remain outstanding.
+At the investigation checkpoint the installed game DLL remained experimental.10;
+neither PC was updated and no GitHub release was created. Live UI verification
+and a controlled comparison remained outstanding.
+
+Subsequent deployment, explicitly requested on 2026-10-21: the above
+experimental.11-dev artifact was installed on both the local Proton game and
+Tety's native-Windows game, with both games/editors closed. Installed hashes
+matched the candidate on both PCs, and verified experimental.10 rollback copies
+were retained on each PC. The local native/builtin dbghelp override was preserved.
+The remote update was silent and neither game was launched. This update adds
+the candidate text workaround, not a reduced-overhead profiler. No GitHub
+publication was requested or performed; live UI verification is still pending.
 
 Before deployment, run the portable suite under ASan/UBSan, compile the x86
 tests and candidate DLL, and record which Windows/Wine executables actually
