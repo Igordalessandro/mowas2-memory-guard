@@ -2,6 +2,7 @@
 
 #include "app/config.h"
 #include "diagnostics/retry_policy.h"
+#include "diagnostics/large_allocation_history.h"
 #include "orchestration/memory_guard.h"
 #include "shared/core/module.h"
 #include "shared/logging/logger.h"
@@ -115,6 +116,14 @@ static thread_local CallsiteStat* g_cached_callsite = nullptr;
 static SampleEntry g_samples[SAMPLE_CAPACITY] = {};
 static HeapStat g_heaps[HEAP_CAPACITY] = {};
 static FlightEvent g_flight[FLIGHT_CAPACITY] = {};
+struct LargeHistoryLock {
+    volatile LONG held = 0;
+    void lock() {
+        while (InterlockedCompareExchange(&held, 1, 0) != 0) SwitchToThread();
+    }
+    void unlock() { InterlockedExchange(&held, 0); }
+};
+static LargeAllocationHistory<LargeHistoryLock> g_large_history;
 static volatile LONG g_sample_lock = 0;
 static volatile LONG g_flight_sequence = 0;
 static volatile LONG g_sample_entries = 0;
@@ -190,6 +199,25 @@ static LONG64 load64(volatile LONG64* value) {
 static DWORD to_game_rva(std::uintptr_t caller) {
     return caller >= g_base && caller < g_base + TARGET_IMAGE_SIZE
         ? static_cast<DWORD>(caller - g_base) : 0xFFFFFFFFu;
+}
+
+static void record_large_request(LargeAllocationKind kind, SIZE_T size,
+                                 DWORD direct_rva, void* result, HANDLE heap,
+                                 DWORD request_flags, DWORD flags = 0) {
+    if (size < LARGE_FLIGHT_BYTES) return;
+    LargeAllocationEvent event {};
+    event.tick = GetTickCount();
+    event.thread_id = GetCurrentThreadId();
+    event.caller_rva = direct_rva;
+    event.engine_rva = g_engine_context_active ? g_engine_context_rva : 0xFFFFFFFFu;
+    event.requested = size;
+    event.engine_requested = g_engine_context_active ? g_engine_context_size : 0;
+    event.result = reinterpret_cast<std::uintptr_t>(result);
+    event.heap = reinterpret_cast<std::uintptr_t>(heap);
+    event.request_flags = request_flags;
+    event.flags = flags;
+    event.kind = kind;
+    g_large_history.record(event);
 }
 
 static HeapStat* heap_stat_for(HANDLE heap) {
@@ -452,7 +480,9 @@ static LPVOID WINAPI profiled_heap_alloc(HANDLE heap, DWORD flags, SIZE_T size) 
     SetLastError(incoming_error);
     LPVOID result = g_originalHeapAlloc(heap, flags, size);
     DWORD native_error = GetLastError();
+    const bool initial_failure = !result;
     if (!result) {
+        memory_guard::capture_failure_snapshot("HeapAlloc", size, direct_rva, "initial");
         SIZE_T released_bytes = 0;
         unsigned retry_count = 0;
         bool recovery_stage_released = false;
@@ -469,6 +499,12 @@ static LPVOID WINAPI profiled_heap_alloc(HANDLE heap, DWORD flags, SIZE_T size) 
             native_error = GetLastError();
             if (result) break;
         }
+        if (retry_count) {
+            memory_guard::capture_failure_snapshot(
+                "HeapAlloc", size, direct_rva, result ? "retry_ok" : "retry_failed");
+        }
+        record_large_request(LargeAllocationKind::heap, size, direct_rva, result,
+                             heap, flags, FLIGHT_FAILURE | (result ? FLIGHT_RECOVERED : 0u));
         record_flight_event(size, rva, result, heap,
                             FLIGHT_FAILURE | (result ? FLIGHT_RECOVERED : 0u));
         log_low_level_failure("HeapAlloc", size, rva, released_bytes,
@@ -477,6 +513,9 @@ static LPVOID WINAPI profiled_heap_alloc(HANDLE heap, DWORD flags, SIZE_T size) 
         if (result && recovery_stage_released) {
             memory_guard::rearm_recovery_if_needed();
         }
+    }
+    if (!initial_failure) {
+        record_large_request(LargeAllocationKind::heap, size, direct_rva, result, heap, flags);
     }
     if (result) insert_sample(result, size, rva, heap);
     SetLastError(native_error);
@@ -499,7 +538,9 @@ static LPVOID WINAPI profiled_heap_realloc(HANDLE heap, DWORD flags,
     SetLastError(incoming_error);
     LPVOID result = g_originalHeapReAlloc(heap, flags, pointer, size);
     DWORD native_error = GetLastError();
+    const bool initial_failure = !result;
     if (!result) {
+        memory_guard::capture_failure_snapshot("HeapReAlloc", size, direct_rva, "initial");
         SIZE_T released_bytes = 0;
         unsigned retry_count = 0;
         bool recovery_stage_released = false;
@@ -516,6 +557,12 @@ static LPVOID WINAPI profiled_heap_realloc(HANDLE heap, DWORD flags,
             native_error = GetLastError();
             if (result) break;
         }
+        if (retry_count) {
+            memory_guard::capture_failure_snapshot(
+                "HeapReAlloc", size, direct_rva, result ? "retry_ok" : "retry_failed");
+        }
+        record_large_request(LargeAllocationKind::realloc, size, direct_rva, result,
+                             heap, flags, FLIGHT_FAILURE | (result ? FLIGHT_RECOVERED : 0u));
         record_flight_event(size, rva, result, heap,
                             FLIGHT_FAILURE | (result ? FLIGHT_RECOVERED : 0u));
         log_low_level_failure("HeapReAlloc", size, rva, released_bytes,
@@ -524,6 +571,9 @@ static LPVOID WINAPI profiled_heap_realloc(HANDLE heap, DWORD flags,
         if (result && recovery_stage_released) {
             memory_guard::rearm_recovery_if_needed();
         }
+    }
+    if (!initial_failure) {
+        record_large_request(LargeAllocationKind::realloc, size, direct_rva, result, heap, flags);
     }
     if (result) {
         retire_sample(previous_sample);
@@ -565,9 +615,11 @@ static LPVOID WINAPI profiled_virtual_alloc(LPVOID address, SIZE_T size,
     SetLastError(incoming_error);
     LPVOID result = g_originalVirtualAlloc(address, size, allocation_type, protect);
     DWORD native_error = GetLastError();
+    const bool initial_failure = !result;
     // A reserve can help only some failures, but all resource-exhaustion
     // errors belong in the crash evidence, including commit-limit failures.
     if (!result && is_resource_exhaustion_error(native_error)) {
+        memory_guard::capture_failure_snapshot("VirtualAlloc", size, rva, "initial");
         const DWORD original_error = native_error;
         SIZE_T released_bytes = 0;
         unsigned retry_count = 0;
@@ -587,6 +639,13 @@ static LPVOID WINAPI profiled_virtual_alloc(LPVOID address, SIZE_T size,
             native_error = GetLastError();
             if (result) break;
         }
+        if (retry_count) {
+            memory_guard::capture_failure_snapshot(
+                "VirtualAlloc", size, rva, result ? "retry_ok" : "retry_failed");
+        }
+        record_large_request(LargeAllocationKind::virtual_alloc, size, rva, result,
+                             nullptr, allocation_type,
+                             FLIGHT_FAILURE | (result ? FLIGHT_RECOVERED : 0u));
         InterlockedIncrement(&g_virtual_failures);
         record_failure_site(rva);
         record_flight_event(size, rva, result, nullptr,
@@ -613,6 +672,8 @@ static LPVOID WINAPI profiled_virtual_alloc(LPVOID address, SIZE_T size,
             memory_guard::rearm_recovery_if_needed();
         }
     } else if (!result) {
+        record_large_request(LargeAllocationKind::virtual_alloc, size, rva, result,
+                             nullptr, allocation_type, FLIGHT_FAILURE);
         InterlockedIncrement(&g_virtual_failures);
         const LONG count = InterlockedIncrement(&g_virtual_nonmemory_failures);
         if (count <= 4) {
@@ -621,6 +682,10 @@ static LPVOID WINAPI profiled_virtual_alloc(LPVOID address, SIZE_T size,
                 size, static_cast<unsigned long>(allocation_type),
                 static_cast<unsigned long>(native_error));
         }
+    }
+    if (!initial_failure) {
+        record_large_request(LargeAllocationKind::virtual_alloc, size, rva, result,
+                             nullptr, allocation_type);
     }
     SetLastError(native_error);
     return result;
@@ -802,6 +867,8 @@ void end_engine_request(void* result, bool initial_failure, bool recovered) {
         record_flight_event(g_engine_context_size, g_engine_context_rva,
                             result, g_engine_context_heap, flags);
     }
+    record_large_request(LargeAllocationKind::engine, g_engine_context_size,
+                         g_engine_context_rva, result, g_engine_context_heap, 0, flags);
 
     g_engine_context_active = false;
     g_engine_context_rva = 0xFFFFFFFFu;
@@ -837,6 +904,30 @@ void log_flight_recorder() {
             static_cast<unsigned long>(thread_id), static_cast<unsigned long>(caller),
             static_cast<unsigned long>(size), result, heap,
             static_cast<unsigned long>(flags));
+    }
+}
+
+void log_large_allocation_history() {
+    LargeAllocationEvent events[16] {};
+    const std::size_t count = g_large_history.snapshot(events, 16);
+    if (!count) return;
+    logger::log("ALLOC LARGE HISTORY : threshold=1048576 capacity=32 showing=%zu completion_order=yes",
+                count);
+    for (std::size_t i = 0; i < count; ++i) {
+        const LargeAllocationEvent& event = events[i];
+        const char* kind = event.kind == LargeAllocationKind::engine ? "engine" :
+                           event.kind == LargeAllocationKind::heap ? "heap" :
+                           event.kind == LargeAllocationKind::realloc ? "realloc" : "virtual";
+        logger::log(
+            "ALLOC LARGE #%llu : kind=%s tick=%lu thread=%lu direct=+%08lX bytes=%zu engine=+%08lX engine_bytes=%zu result=%p heap=%p request_flags=0x%08lX event_flags=0x%02lX",
+            static_cast<unsigned long long>(event.sequence), kind,
+            static_cast<unsigned long>(event.tick),
+            static_cast<unsigned long>(event.thread_id),
+            static_cast<unsigned long>(event.caller_rva), event.requested,
+            static_cast<unsigned long>(event.engine_rva), event.engine_requested,
+            reinterpret_cast<void*>(event.result), reinterpret_cast<void*>(event.heap),
+            static_cast<unsigned long>(event.request_flags),
+            static_cast<unsigned long>(event.flags));
     }
 }
 
@@ -975,6 +1066,7 @@ void log_summary(bool detailed) {
             static_cast<unsigned long long>(load64(&heap.sample_freed_bytes)) / 1024ull);
     }
     log_flight_recorder();
+    log_large_allocation_history();
 }
 
 bool install(std::uintptr_t game_base) {

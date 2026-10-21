@@ -30,6 +30,12 @@ bool reuse_during_free = false;
 void* sampled_pointer = nullptr;
 void* replacement_pointer = nullptr;
 char failure_report[192] = {};
+unsigned snapshot_calls = 0;
+unsigned snapshot_release_calls[2] = {};
+unsigned snapshot_native_calls[2] = {};
+char snapshot_phases[2][16] = {};
+DWORD snapshot_errors[2] = {};
+bool insert_during_logging = false;
 }
 
 namespace memory_guard {
@@ -42,10 +48,29 @@ ReleasedReserve release_after_failure() {
 }
 void rearm_recovery_if_needed() { last_error = 0xBAD; }
 bool is_under_pressure() { return false; }
+void capture_failure_snapshot(const char*, std::size_t, std::uintptr_t, const char* phase) {
+    assert(snapshot_calls < 2);
+    snapshot_release_calls[snapshot_calls] = release_calls;
+    snapshot_native_calls[snapshot_calls] = native_calls;
+    snapshot_errors[snapshot_calls] = last_error;
+    std::snprintf(snapshot_phases[snapshot_calls], sizeof(snapshot_phases[0]), "%s", phase);
+    ++snapshot_calls;
+    last_error = 0xBAD;
+}
 }
 namespace core { void register_module(const ModuleSpec&) {} }
 namespace logger {
-void log(const char*, ...) { last_error = 0xBAD; }
+void log(const char*, ...) {
+    if (insert_during_logging) {
+        // A producer must remain free to acquire the history lock while a
+        // copied snapshot is logged; logging while holding it deadlocks.
+        insert_during_logging = false;
+        allocator_profiler::record_large_request(
+            allocator_profiler::LargeAllocationKind::heap, 1024u * 1024u,
+            20, nullptr, nullptr, 0);
+    }
+    last_error = 0xBAD;
+}
 void report_failure(const char* format, ...) {
     va_list args;
     va_start(args, format);
@@ -96,6 +121,7 @@ void reset() {
     g_sample_live_bytes = 0;
     g_engine_context_active = true;
     g_engine_context_rva = 10;
+    g_engine_context_size = 2u * 1024u * 1024u;
     g_originalHeapAlloc = &allocate;
     g_originalHeapReAlloc = &reallocate;
     g_originalHeapFree = &free_block;
@@ -106,6 +132,7 @@ void reset() {
     error_on_failure = ERROR_NOT_ENOUGH_MEMORY;
     last_error = incoming_error;
     failure_report[0] = '\0';
+    snapshot_calls = 0;
 }
 }
 
@@ -169,6 +196,10 @@ int main() {
     assert(last_error == ERROR_NOT_ENOUGH_MEMORY);
     assert(g_sample_entries == 1 && load64(&g_sample_live_bytes) == 100);
     assert(detach_sample(sampled_pointer).size == 100);
+    assert(snapshot_calls == 1 && snapshot_release_calls[0] == 0);
+    assert(snapshot_native_calls[0] == 1);
+    assert(std::strcmp(snapshot_phases[0], "initial") == 0);
+    assert(snapshot_errors[0] == ERROR_NOT_ENOUGH_MEMORY);
 
     reset();
     stages_available = 4;
@@ -176,6 +207,7 @@ int main() {
     assert(!profiled_virtual_alloc(nullptr, 4096, MEM_RESERVE, PAGE_READWRITE));
     assert(release_calls == 0 && native_calls == 1);
     assert(stages_available == 4 && last_error == ERROR_INVALID_PARAMETER);
+    assert(snapshot_calls == 0);
 
     reset();
     stages_available = 4;
@@ -183,6 +215,7 @@ int main() {
     assert(release_calls == 0 && stages_available == 4);
     assert(std::strstr(failure_report, "failure=VirtualAlloc"));
     assert(std::strstr(failure_report, "retries=0 result=not_attempted"));
+    assert(snapshot_calls == 1 && snapshot_release_calls[0] == 0);
 
     reset();
     stages_available = 4;
@@ -192,6 +225,7 @@ int main() {
     assert(last_error == ERROR_COMMITMENT_LIMIT);
     assert(std::strstr(failure_report, "err=1455"));
     assert(std::strstr(failure_report, "retries=0 result=not_attempted"));
+    assert(snapshot_calls == 1 && snapshot_errors[0] == ERROR_COMMITMENT_LIMIT);
 
     reset();
     stages_available = 4;
@@ -200,10 +234,57 @@ int main() {
            replacement_pointer);
     assert(release_calls == 2 && native_calls == 3 && stages_available == 2);
     assert(last_error == ERROR_ALREADY_EXISTS);
+    assert(snapshot_calls == 2 && snapshot_release_calls[0] == 0);
+    assert(snapshot_native_calls[0] == 1 && snapshot_native_calls[1] == 3);
+    assert(snapshot_release_calls[1] == 2);
+    assert(std::strcmp(snapshot_phases[1], "retry_ok") == 0);
+    assert(snapshot_errors[1] == ERROR_ALREADY_EXISTS);
+
+    reset();
+    stages_available = 2;
+    assert(!profiled_heap_alloc(nullptr, 0, 2u * 1024u * 1024u));
+    assert(snapshot_calls == 2 && snapshot_release_calls[0] == 0);
+    assert(snapshot_native_calls[0] == 1 && snapshot_native_calls[1] == 3);
+    assert(std::strcmp(snapshot_phases[1], "retry_failed") == 0);
+    assert(last_error == ERROR_NOT_ENOUGH_MEMORY);
+
+    reset();
+    stages_available = 2;
+    succeed_on_call = 2;
+    assert(profiled_heap_realloc(nullptr, HEAP_ZERO_MEMORY, nullptr,
+                                 2u * 1024u * 1024u) == replacement_pointer);
+    assert(snapshot_calls == 2 && snapshot_release_calls[0] == 0);
+    assert(snapshot_native_calls[1] == 2 && snapshot_release_calls[1] == 1);
+    assert(std::strcmp(snapshot_phases[1], "retry_ok") == 0);
+    assert(last_error == ERROR_ALREADY_EXISTS);
+    LargeAllocationEvent recent[1] {};
+    assert(g_large_history.snapshot(recent, 1) == 1);
+    assert(recent[0].kind == LargeAllocationKind::realloc);
+    assert(recent[0].engine_rva == 10 && recent[0].engine_requested == 2u * 1024u * 1024u);
+    assert(recent[0].request_flags == HEAP_ZERO_MEMORY);
+    assert(recent[0].flags == (FLIGHT_FAILURE | FLIGHT_RECOVERED));
 
     reset();
     succeed_on_call = 1;
     assert(profiled_heap_alloc(nullptr, 0, 128) == replacement_pointer);
     assert(last_error == ERROR_ALREADY_EXISTS);
+    assert(snapshot_calls == 0);
+
+    // Direct low-level and enclosing engine requests remain separate records.
+    reset();
+    succeed_on_call = 1;
+    assert(profiled_heap_alloc(nullptr, 0, 1024u * 1024u) == replacement_pointer);
+    end_engine_request(replacement_pointer, false, false);
+    LargeAllocationEvent nested[2] {};
+    assert(g_large_history.snapshot(nested, 2) == 2);
+    assert(nested[0].kind == LargeAllocationKind::heap);
+    assert(nested[0].engine_rva == 10);
+    assert(nested[0].requested == 1024u * 1024u);
+    assert(nested[0].engine_requested == 2u * 1024u * 1024u);
+    assert(nested[1].kind == LargeAllocationKind::engine);
+    assert(nested[1].caller_rva == 10);
+    insert_during_logging = true;
+    log_large_allocation_history();
+    assert(!insert_during_logging);
     return 0;
 }

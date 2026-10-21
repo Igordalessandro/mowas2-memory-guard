@@ -1,5 +1,6 @@
 #include "orchestration/memory_guard.h"
 #include "orchestration/recovery_state.h"
+#include "diagnostics/address_space_stats.h"
 
 #include "app/config.h"
 #include "shared/logging/logger.h"
@@ -37,6 +38,8 @@ struct AddressSpaceSnapshot {
     unsigned long long reserved_bytes;
     SIZE_T largest_free;
     void* largest_free_base;
+    diagnostics::AllocatableHoles holes;
+    bool complete;
 };
 
 static PVOID volatile g_primaryReserve = nullptr;
@@ -70,24 +73,38 @@ static volatile LONG g_largestRequest = 0;
 static volatile LONG g_underPressure = 0;
 static volatile LONG g_finalProtectionLogged = 0;
 
+struct PreserveLastError {
+    DWORD error = GetLastError();
+    ~PreserveLastError() { SetLastError(error); }
+};
+
 static AddressSpaceSnapshot scan_address_space() {
     AddressSpaceSnapshot result = {};
     SYSTEM_INFO si = {};
     GetSystemInfo(&si);
 
-    std::uintptr_t cursor = reinterpret_cast<std::uintptr_t>(si.lpMinimumApplicationAddress);
-    const std::uintptr_t limit = reinterpret_cast<std::uintptr_t>(si.lpMaximumApplicationAddress);
+    // Use a wide cursor so the last x86 region can end at 0x100000000
+    // without wrapping to zero and incorrectly marking the scan incomplete.
+    std::uint64_t cursor = reinterpret_cast<std::uintptr_t>(si.lpMinimumApplicationAddress);
+    const std::uint64_t limit = reinterpret_cast<std::uintptr_t>(si.lpMaximumApplicationAddress);
 
-    while (cursor < limit) {
+    while (cursor <= limit) {
         MEMORY_BASIC_INFORMATION mbi = {};
-        SIZE_T queried = VirtualQuery(reinterpret_cast<LPCVOID>(cursor), &mbi, sizeof(mbi));
+        SIZE_T queried = VirtualQuery(reinterpret_cast<LPCVOID>(
+            static_cast<std::uintptr_t>(cursor)), &mbi, sizeof(mbi));
         if (queried == 0 || mbi.RegionSize == 0) break;
 
+        const std::uint64_t base = reinterpret_cast<std::uintptr_t>(mbi.BaseAddress);
+        const std::uint64_t next = base + static_cast<std::uint64_t>(mbi.RegionSize);
+        if (base > cursor || next <= cursor) break;
+        // Preserve the original policy totals and largest-region measurement;
+        // only the diagnostic fit counts account for allocation granularity.
         const unsigned long long region = static_cast<unsigned long long>(mbi.RegionSize);
         if (mbi.State == MEM_FREE) {
             result.free_bytes += region;
-            if (mbi.RegionSize > result.largest_free) {
-                result.largest_free = mbi.RegionSize;
+            result.holes.add(base, region, si.dwAllocationGranularity);
+            if (region > result.largest_free) {
+                result.largest_free = static_cast<SIZE_T>(region);
                 result.largest_free_base = mbi.BaseAddress;
             }
         } else if (mbi.State == MEM_COMMIT) {
@@ -96,12 +113,39 @@ static AddressSpaceSnapshot scan_address_space() {
             result.reserved_bytes += region;
         }
 
-        const std::uintptr_t base = reinterpret_cast<std::uintptr_t>(mbi.BaseAddress);
-        const std::uintptr_t next = base + static_cast<std::uintptr_t>(mbi.RegionSize);
-        if (next <= cursor) break;
+        if (next > limit) {
+            result.complete = true;
+            break;
+        }
         cursor = next;
     }
     return result;
+}
+
+static unsigned long guard_mib() {
+    const auto recovery = g_recovery.snapshot();
+    return static_cast<unsigned long>(
+        ((g_primaryReserve ? g_primaryReserveSize : 0) +
+         (g_criticalReserve ? g_criticalReserveSize : 0) +
+         (g_finalReserve ? g_finalReserveSize : 0) + recovery.reserve.bytes) / MiB);
+}
+
+static void log_preflight_release(const char* stage, std::size_t size,
+                                  std::uintptr_t caller_rva,
+                                  const AddressSpaceSnapshot& before,
+                                  const AddressSpaceSnapshot& after) {
+    // Only actual releases emit a line. A re-armed primary stage must also
+    // retain its next exact trigger; ordinary requests never log here.
+    logger::log(
+        "MEM GUARD PREFLIGHT : stage=%s bytes=%zu site=+%08lX thread=%lu tick=%lu "
+        "before_free=%lluKiB before_largest=%lluKiB after_free=%lluKiB after_largest=%lluKiB complete=%u/%u",
+        stage, size, static_cast<unsigned long>(caller_rva),
+        static_cast<unsigned long>(GetCurrentThreadId()),
+        static_cast<unsigned long>(GetTickCount()), before.free_bytes / 1024ull,
+        static_cast<unsigned long long>(before.largest_free) / 1024ull,
+        after.free_bytes / 1024ull,
+        static_cast<unsigned long long>(after.largest_free) / 1024ull,
+        before.complete ? 1u : 0u, after.complete ? 1u : 0u);
 }
 
 static bool release_reserve(PVOID volatile* reserve_slot,
@@ -230,6 +274,12 @@ static void log_snapshot(const AddressSpaceSnapshot& snapshot, bool low) {
         largest / 1024,
         have_process ? static_cast<unsigned long long>(pmc.PrivateUsage) / MiB : 0ull,
         have_process ? static_cast<unsigned long long>(pmc.WorkingSetSize) / MiB : 0ull);
+    logger::log("MEM HOLES : fit4/8/16/32MiB=%lu/%lu/%lu/%lu complete=%u",
+                static_cast<unsigned long>(snapshot.holes.counts[0]),
+                static_cast<unsigned long>(snapshot.holes.counts[1]),
+                static_cast<unsigned long>(snapshot.holes.counts[2]),
+                static_cast<unsigned long>(snapshot.holes.counts[3]),
+                snapshot.complete ? 1u : 0u);
     char largest_field[40] = {};
     if (snapshot.largest_free < MiB) {
         snprintf(largest_field, sizeof(largest_field), "largest=%lluKiB",
@@ -276,9 +326,10 @@ static DWORD WINAPI monitor_thread(LPVOID) {
         if (critical) release_critical(RELEASE_LOW_ADDRESS_SPACE);
         // Do not release the final contiguous block merely because general
         // address-space pressure is high. The RobZ failure report showed that
-        // doing so let small allocations consume the block before a later
-        // ~33 MiB request arrived. Size-aware engine preflight and the
-        // low-level failure/retry paths remain authorized to release it.
+        // released space remained available for over a minute, then was no
+        // longer protected when demand arrived. New diagnostics record the
+        // exact release trigger; size-aware preflight and failure/retry paths
+        // remain authorized to release it.
         if (emergency && g_finalReserve &&
             InterlockedCompareExchange(&g_finalProtectionLogged, 1, 0) == 0) {
             logger::log(
@@ -461,8 +512,9 @@ bool install() {
     return true;
 }
 
-void before_allocation(std::size_t size) {
+void before_allocation(std::size_t size, std::uintptr_t caller_rva) {
     if (size < 8u * 1024u * 1024u) return;
+    PreserveLastError preserve_error;
 
     const unsigned long long margin =
         static_cast<unsigned long long>(LARGE_ALLOCATION_MARGIN_MB) * MiB;
@@ -487,14 +539,51 @@ void before_allocation(std::size_t size) {
     // The separate recovery block is deliberately not released by preflight;
     // it remains available for a later observed allocation failure.
     if (release_primary(RELEASE_LARGE_REQUEST)) {
-        snapshot = scan_address_space();
+        const AddressSpaceSnapshot after = scan_address_space();
+        log_preflight_release("primary", size, caller_rva, snapshot, after);
+        snapshot = after;
         if (has_headroom(snapshot)) return;
     }
     if (release_critical(RELEASE_LARGE_REQUEST)) {
-        snapshot = scan_address_space();
+        const AddressSpaceSnapshot after = scan_address_space();
+        log_preflight_release("critical", size, caller_rva, snapshot, after);
+        snapshot = after;
         if (has_headroom(snapshot)) return;
     }
-    release_final(RELEASE_LARGE_REQUEST);
+    if (release_final(RELEASE_LARGE_REQUEST)) {
+        log_preflight_release("final", size, caller_rva,
+                              snapshot, scan_address_space());
+    }
+}
+
+void capture_failure_snapshot(const char* api, std::size_t bytes,
+                              std::uintptr_t caller_rva, const char* phase) {
+    PreserveLastError preserve_error;
+    const AddressSpaceSnapshot snapshot = scan_address_space();
+    const unsigned long guard = guard_mib();
+    const DWORD tick = GetTickCount();
+    logger::log(
+        "MEM FAILURE SNAPSHOT : api=%s bytes=%zu site=+%08lX phase=%s thread=%lu tick=%lu "
+        "free=%lluKiB largest=%lluKiB committed=%lluMiB reserved=%lluMiB guard=%luMiB "
+        "fit4/8/16/32MiB=%lu/%lu/%lu/%lu complete=%u",
+        api ? api : "unknown", bytes, static_cast<unsigned long>(caller_rva),
+        phase ? phase : "unknown", static_cast<unsigned long>(GetCurrentThreadId()),
+        static_cast<unsigned long>(tick), snapshot.free_bytes / 1024ull,
+        static_cast<unsigned long long>(snapshot.largest_free) / 1024ull,
+        snapshot.committed_bytes / MiB, snapshot.reserved_bytes / MiB, guard,
+        static_cast<unsigned long>(snapshot.holes.counts[0]),
+        static_cast<unsigned long>(snapshot.holes.counts[1]),
+        static_cast<unsigned long>(snapshot.holes.counts[2]),
+        static_cast<unsigned long>(snapshot.holes.counts[3]), snapshot.complete ? 1u : 0u);
+    logger::report_failure_memory(
+        "mem_fail phase=%.12s free=%lluMiB largest=%lluKiB guard=%luMiB holes4/8/16/32=%lu/%lu/%lu/%lu tick=%lu complete=%u",
+        phase ? phase : "unknown", snapshot.free_bytes / MiB,
+        static_cast<unsigned long long>(snapshot.largest_free) / 1024ull, guard,
+        static_cast<unsigned long>(snapshot.holes.counts[0]),
+        static_cast<unsigned long>(snapshot.holes.counts[1]),
+        static_cast<unsigned long>(snapshot.holes.counts[2]),
+        static_cast<unsigned long>(snapshot.holes.counts[3]),
+        static_cast<unsigned long>(tick), snapshot.complete ? 1u : 0u);
 }
 
 ReleasedReserve release_after_failure() {

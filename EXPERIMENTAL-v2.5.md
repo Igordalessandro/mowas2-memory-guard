@@ -1,9 +1,10 @@
 # v2.5 allocator-diagnostics experiment
 
-The current prerelease is `2.5.0-experimental.9`, prepared from the reviewed
-experimental.9-dev candidate. The [2026-10-20 review record](docs/REVIEW-2026-10-20.md)
-describes the concurrency, allocator-observation, path, and crash-report repairs
-included in this release.
+The current prerelease is `2.5.0-experimental.10`. It preserves experimental.9's
+allocation policy and adds exact preflight-release attribution, fresh failure
+snapshots, a separate large-allocation history, and aligned free-hole counts.
+See the [experimental.10 diagnostic guide](docs/EXPERIMENTAL-10-Diagnostics.md)
+and the [experimental.9 review record](docs/REVIEW-2026-10-20.md).
 
 This branch starts from the published v2.4.2 stable rollback build. It does
 not add SteamMatchmaking hooks and does not weaken either fail-closed VAC
@@ -49,9 +50,9 @@ extended-length paths. The detailed log records whether these rewrites succeed
 without recording users' path text. This does not alter resource hashes or
 network data, and it cannot recover a path already truncated inside the game.
 
-Experimental.8 responds to a second native-Windows RobZ report. A roughly
-33 MiB request had already consumed the 48 MiB final reserve; later, a heap
-backing request just over 16 MiB failed with 55 MiB total VA free but only a
+Experimental.8 responds to a second native-Windows RobZ report. The
+48 MiB final reserve had already been released for a large request; later,
+a heap request just over 16 MiB failed with 55 MiB total VA free but only a
 4 MiB largest hole. The process accounted for roughly 4,094 MiB of its x86
 address space and no guard remained. Experimental.8 therefore adds a separate
 32 MiB failure-only recovery reserve, releases and retries one stage at a time,
@@ -59,6 +60,14 @@ reduces large-request preflight margin from 16 MiB to 4 MiB so the recovery
 stage stays protected, and adaptively re-reserves 8–32 MiB after a successful
 recovery when a sufficiently large region remains. Reports now distinguish a
 failed retry from a retry that was never attempted because no reserve remained.
+
+The subsequently supplied full experimental.6 log refines that interpretation:
+the final block was released about 3 minutes 19 seconds before the failure, and
+a 64 MiB free region around its old address persisted for over a minute after
+release. It does not prove that the largest observed 33 MiB request consumed
+that block. Experimental.10 adds direct attribution and separate histories to
+distinguish release, later reuse and fragmentation instead of inferring them
+from widely spaced periodic snapshots.
 
 The secure-join guard no longer overwrites the Proton-owned SteamUser018
 vtable. It detours only the implementation already referenced by the

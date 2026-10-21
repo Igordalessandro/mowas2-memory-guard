@@ -13,7 +13,7 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
-      - name: Test production recovery state, report format and retry policy
+      - name: Test recovery, reports, retry policy and diagnostic histories
         run: bash tests/run-native.sh
         env:
           MOWAS2_TEST_SANITIZERS: '1'

@@ -2,7 +2,7 @@
 
 > [!IMPORTANT]
 > The `experimental/allocator-diagnostics-v2.5` branch is not the public stable
-> release. Its DLL identifies itself as `2.5.0-experimental.9`. Use the v2.4.2
+> release. Its DLL identifies itself as `2.5.0-experimental.10`. Use the v2.4.2
 > GitHub release for the stable rollback build.
 
 An experimental 32-bit proxy DLL for the Steam edition of *Men of War: Assault
@@ -132,6 +132,11 @@ overwrite the game's `DLL Crash Report.txt`.
 - Carries the higher-level engine caller into retained-allocation samples,
   records sampled heap identity and heap compatibility mode, and retains a
   fixed 256-entry allocation flight recorder for large and low-memory requests.
+- Keeps a separate fixed history of large allocations so small pressure events
+  cannot overwrite it, including both native-call and engine-context details.
+- Records the request, caller and before/after address-space measurements when
+  large-request preflight releases a reserve. Failure paths capture fresh
+  memory measurements and counts of holes that can fit 4/8/16/32 MiB requests.
 - Validates both hook-site signatures and rolls back partial hook installation
   instead of patching an unknown executable.
 - Forwards `ImageNtHeader` and `MiniDumpWriteDump` to the real system
@@ -201,7 +206,7 @@ also placed in `%TEMP%` so the proxy can forward both `ImageNtHeader` and
 `MiniDumpWriteDump`.
 
 The same folder contains **`DLL Crash Report.txt`**. Before each new run,
-the development build saves its previous contents as
+the DLL saves its previous contents as
 `DLL Crash Report.previous.txt`. The current file is continuously refreshed
 with the version, platform, guard status,
 latest memory snapshot, allocator totals, hottest sampled call sites, last
@@ -213,10 +218,17 @@ and has a hard 900-byte ceiling so the entire file fits in Steam's roughly
 session and memory data take priority if optional details do not fit.
 `omitted=optional_fields` means the detailed session log contains more data.
 A report remains useful after a silent crash,
-but it can also describe a healthy or still-running session. The development
-build also writes a small `DLL Emergency Crash.txt` before regular exception
+but it can also describe a healthy or still-running session. The DLL
+also writes a small `DLL Emergency Crash.txt` before regular exception
 formatting, preserving basic evidence even if the logger is busy; its previous
 session is saved as `DLL Emergency Crash.previous.txt`.
+
+Experimental.10 pins a `mem_fail` measurement after an allocation failure, so
+later periodic updates cannot erase the failure-time evidence. Its phase says
+whether the snapshot preceded recovery (`initial`) or followed actual retries
+(`retry_ok`/`retry_failed`). Before any failure, the ordinary `mem` line remains
+live. The detailed log contains the full snapshot and separate large-allocation
+history; include it when investigating a remaining memory crash.
 
 When reporting a problem, paste the entire contents of `DLL Crash Report.txt`
 and separately state the active mods, last in-game action, and whether the game
@@ -293,7 +305,9 @@ Steam, install hooks, or show dialogs. The GitHub workflow runs both suites;
 cross-compiling Windows tests alone does not count as executing them.
 
 See [the review record](docs/REVIEW-2026-10-20.md) for the development fixes,
-their limits, and outstanding field validation. Community reports come from
+their limits, and outstanding field validation, and the
+[experimental.10 diagnostic guide](docs/EXPERIMENTAL-10-Diagnostics.md) for the
+new evidence fields and tests. Community reports come from
 [this Steam discussion](https://steamcommunity.com/app/244450/discussions/0/591817814333171584/).
 
 The resulting `dist/dbghelp.dll` goes in the game folder. The v2 artifact built from this working copy is intentionally different from the upstream v1 release.

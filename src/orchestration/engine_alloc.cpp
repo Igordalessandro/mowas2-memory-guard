@@ -47,21 +47,28 @@ static void* guarded_allocate(PFN_EngineAlloc original, size_t size, const char*
                               std::uintptr_t caller) {
     if (!original) return nullptr;
 
+    const DWORD incoming_error = GetLastError();
+    const std::uintptr_t caller_rva = g_gameBase != 0 && caller >= g_gameBase &&
+                                    caller - g_gameBase < 0x00CFC000u
+        ? caller - g_gameBase : 0xFFFFFFFFu;
     HookDepthScope depth;
     if (depth.outermost) {
         size = apply_known_lobby_workaround(size, hookName);
         allocator_profiler::begin_engine_request(size, caller);
         memory_guard::record_request(size);
-        memory_guard::before_allocation(size);
+        memory_guard::before_allocation(size, caller_rva);
     }
 
+    SetLastError(incoming_error);
     void* result = original(size);
+    DWORD native_error = GetLastError();
     bool allocation_failed = false;
     std::size_t released_bytes = 0;
     unsigned retry_count = 0;
     bool recovery_stage_released = false;
     if (depth.outermost && !result) {
         allocation_failed = true;
+        memory_guard::capture_failure_snapshot(hookName, size, caller_rva, "initial");
         for (;;) {
             const memory_guard::ReleasedReserve released =
                 memory_guard::release_after_failure();
@@ -70,8 +77,14 @@ static void* guarded_allocate(PFN_EngineAlloc original, size_t size, const char*
             recovery_stage_released =
                 recovery_stage_released || released.recovery_stage;
             ++retry_count;
+            SetLastError(incoming_error);
             result = original(size);
+            native_error = GetLastError();
             if (result) break;
+        }
+        if (retry_count != 0) {
+            memory_guard::capture_failure_snapshot(
+                hookName, size, caller_rva, result ? "retry_ok" : "retry_failed");
         }
     }
     if (depth.outermost) {
@@ -85,7 +98,9 @@ static void* guarded_allocate(PFN_EngineAlloc original, size_t size, const char*
         memory_guard::record_failure(size, hookName, released_bytes,
                                      retry_count, result != nullptr);
         allocator_profiler::log_flight_recorder();
+        allocator_profiler::log_large_allocation_history();
     }
+    SetLastError(native_error);
     return result;
 }
 

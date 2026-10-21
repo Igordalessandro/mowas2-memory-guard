@@ -26,4 +26,8 @@ void log_summary(bool detailed);
 // Writes the newest entries from the fixed, allocation-free flight recorder.
 void log_flight_recorder();
 
+// Large requests have a separate bounded history, unaffected by small
+// pressure events. The newest 16 entries are copied before logging.
+void log_large_allocation_history();
+
 } // namespace allocator_profiler

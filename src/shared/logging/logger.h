@@ -10,6 +10,9 @@ void log(const char* fmt, ...);
 // The complete report is rewritten after each update and never exceeds the
 // configured Steam-comment-safe byte limit.
 void report_memory(const char* fmt, ...);
+// Pins a fresh allocation-failure memory snapshot in the compact report.
+// Periodic monitoring continues in the detailed log without replacing it.
+void report_failure_memory(const char* fmt, ...);
 void report_allocator(const char* fmt, ...);
 void report_hotspot(const char* fmt, ...);
 void report_event(const char* fmt, ...);

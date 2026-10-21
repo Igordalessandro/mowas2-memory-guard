@@ -19,12 +19,16 @@ $sources = @(
     'vac_guard_tests',
     'crash_report_tests',
     'dbghelp_proxy_tests',
-    'logger_tests'
+    'logger_tests',
+    'address_space_stats_test',
+    'large_allocation_history_test',
+    'memory_guard_diagnostics_tests',
+    'engine_alloc_tests'
 )
 foreach ($name in $sources) {
     $source = Join-Path $PSScriptRoot "$name.cpp"
     $executable = Join-Path $OutputDirectory "$name.exe"
-    & $compiler '-std=c++17' '-O2' '-Wall' '-Wextra' '-Wconversion' '-Werror' '-fms-extensions' '-D_WIN32_WINNT=0x0601' "-I$projectRoot/src" "-I$projectRoot/thirdparty/minhook/include" '-static' $source '-o' $executable
+    & $compiler '-std=c++17' '-O2' '-Wall' '-Wextra' '-Wconversion' '-Werror' '-fms-extensions' '-D_WIN32_WINNT=0x0601' "-I$projectRoot/src" "-I$projectRoot/thirdparty/minhook/include" '-static' $source '-o' $executable '-lpsapi'
     if ($LASTEXITCODE -ne 0) { throw "Compilation failed: $name" }
     if (-not $CompileOnly) {
         & $executable

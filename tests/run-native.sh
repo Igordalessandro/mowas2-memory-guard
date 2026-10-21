@@ -3,7 +3,7 @@ set -euo pipefail
 
 project_root=$(cd "$(dirname "$0")/.." && pwd)
 test_build_dir=$(mktemp -d /tmp/mowas2-native-tests.XXXXXX)
-trap 'rm -f -- "$test_build_dir/recovery-test" "$test_build_dir/report-test" "$test_build_dir/retry-test"; rmdir -- "$test_build_dir"' EXIT
+trap 'rm -f -- "$test_build_dir/recovery-test" "$test_build_dir/report-test" "$test_build_dir/retry-test" "$test_build_dir/address-test" "$test_build_dir/large-history-test"; rmdir -- "$test_build_dir"' EXIT
 
 test_cxx=${CXX:-g++}
 flags=(-std=c++17 -Wall -Wextra -Wconversion -Werror -pthread -I"$project_root/src")
@@ -17,4 +17,8 @@ fi
 "$test_build_dir/report-test"
 "$test_cxx" "${flags[@]}" "$project_root/tests/retry_policy_test.cpp" -o "$test_build_dir/retry-test"
 "$test_build_dir/retry-test"
+"$test_cxx" "${flags[@]}" "$project_root/tests/address_space_stats_test.cpp" -o "$test_build_dir/address-test"
+"$test_build_dir/address-test"
+"$test_cxx" "${flags[@]}" "$project_root/tests/large_allocation_history_test.cpp" -o "$test_build_dir/large-history-test"
+"$test_build_dir/large-history-test"
 echo "All native regression tests passed."

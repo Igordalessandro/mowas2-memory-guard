@@ -24,6 +24,7 @@ static constexpr int INIT_BUSY_WAIT_MS = 1000;
 static char g_reportSession[160] = {};
 static char g_reportConfig[128] = {};
 static char g_reportMemory[160] = {"mem=not_available"};
+static char g_reportFailureMemory[160] = {};
 static char g_reportAllocator[160] = {"alloc=not_available"};
 static char g_reportHotspot[128] = {"hotspot=not_available"};
 static char g_reportEvent[128] = {"event=startup"};
@@ -37,7 +38,8 @@ static void rewrite_compact_report_locked() {
     static_assert(CRASH_REPORT_MAX_BYTES == compact_report::max_bytes,
                   "Keep the portable formatter and Steam report limit synchronized");
     const compact_report::Fields fields = {
-        g_reportSession, g_reportCrash, g_reportFailure, g_reportMemory,
+        g_reportSession, g_reportCrash, g_reportFailure,
+        g_reportFailureMemory[0] ? g_reportFailureMemory : g_reportMemory,
         g_reportConfig, g_reportAllocator, g_reportHotspot, g_reportEvent
     };
     const size_t used = compact_report::build(output, sizeof(output), fields);
@@ -347,6 +349,13 @@ void report_memory(const char* fmt, ...) {
     va_list args;
     va_start(args, fmt);
     update_report_field(g_reportMemory, sizeof(g_reportMemory), false, fmt, args);
+    va_end(args);
+}
+
+void report_failure_memory(const char* fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    update_report_field(g_reportFailureMemory, sizeof(g_reportFailureMemory), true, fmt, args);
     va_end(args);
 }
 

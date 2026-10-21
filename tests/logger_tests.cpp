@@ -100,6 +100,20 @@ void previous_reports_survive() {
         else if (character == '\n') assert(i > 0 && report[i - 1] == '\r');
         else assert(character >= 32 && character <= 126);
     }
+
+    // Monitoring after an allocation failure must not replace the fresh
+    // failure-time measurement with a later, potentially recovered snapshot.
+    logger::report_failure_memory("mem_fail phase=initial free=55MiB largest=4096KiB guard=0MiB holes4/8/16/32=1/0/0/0 tick=123 complete=yes");
+    logger::report_memory("mem free=900MiB largest=500MiB");
+    auto pinned = read(L"DLL Crash Report.txt");
+    assert(pinned.find("mem_fail phase=initial free=55MiB") != std::string::npos);
+    assert(pinned.find("mem free=900MiB") == std::string::npos);
+    assert(pinned.size() <= 900);
+    logger::report_failure_memory("mem_fail phase=retry_ok free=60MiB largest=8192KiB");
+    logger::report_memory("mem free=1000MiB largest=600MiB");
+    pinned = read(L"DLL Crash Report.txt");
+    assert(pinned.find("mem_fail phase=retry_ok free=60MiB") != std::string::npos);
+    assert(pinned.find("phase=initial") == std::string::npos);
 }
 
 void busy_lock_still_records_emergency() {

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 
 namespace memory_guard {
 
@@ -9,7 +10,14 @@ bool install();
 
 // Cheap for ordinary allocations.  Large requests receive an immediate
 // address-space check so the reserve can be released before calling the game.
-void before_allocation(std::size_t size);
+void before_allocation(std::size_t size,
+                       std::uintptr_t caller_rva = 0xffffffffu);
+
+// Performs a fresh address-space scan only on observed allocation failures.
+// The compact failure field is separate from periodic monitor snapshots. This
+// function preserves the caller's GetLastError value.
+void capture_failure_snapshot(const char* api, std::size_t bytes,
+                              std::uintptr_t caller_rva, const char* phase);
 
 struct ReleasedReserve {
     std::size_t bytes;
