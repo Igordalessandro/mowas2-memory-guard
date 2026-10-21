@@ -6,6 +6,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <initializer_list>
 
 namespace {
 DWORD last_error = 0;
@@ -23,6 +24,8 @@ namespace {
 unsigned release_calls = 0;
 unsigned stages_available = 0;
 unsigned native_calls = 0;
+SIZE_T native_size = 0;
+DWORD native_flags = 0;
 unsigned succeed_on_call = 0;
 DWORD error_on_failure = ERROR_NOT_ENOUGH_MEMORY;
 bool free_succeeds = true;
@@ -88,8 +91,10 @@ void native_call() {
     assert(last_error == incoming_error);
     ++native_calls;
 }
-LPVOID WINAPI allocate(HANDLE, DWORD, SIZE_T) {
+LPVOID WINAPI allocate(HANDLE, DWORD flags, SIZE_T size) {
     native_call();
+    native_size = size;
+    native_flags = flags;
     const bool success = succeed_on_call && native_calls >= succeed_on_call;
     last_error = success ? ERROR_ALREADY_EXISTS : error_on_failure;
     return success ? replacement_pointer : nullptr;
@@ -116,8 +121,12 @@ void reset() {
     std::memset(g_callsites, 0, sizeof(g_callsites));
     std::memset(g_samples, 0, sizeof(g_samples));
     std::memset(g_heaps, 0, sizeof(g_heaps));
-    g_callsites_saturated = g_sample_entries = g_sample_drops = 0;
-    g_callsite_cache_valid = false;
+    g_callsites_saturated.store(false);
+    g_sample_entries = g_sample_drops = 0;
+    g_callsite_cache.clear();
+    g_light_profile = false;
+    g_request_site_sampler = diagnostics::RequestSiteSampler(42);
+    g_request_site_sampler_ready = true;
     g_sample_live_bytes = 0;
     g_engine_context_active = true;
     g_engine_context_rva = 10;
@@ -136,7 +145,7 @@ void reset() {
 }
 }
 
-int main() {
+int main(int argc, char** argv) {
     using namespace allocator_profiler;
     // Synthetic addresses are only identities, never dereferenced.
     for (std::uintptr_t address = 16; !replacement_pointer; address += 16) {
@@ -149,7 +158,7 @@ int main() {
     reset();
     assert(insert_sample(sampled_pointer, 100, 10, nullptr));
     const SampleEntry detached = detach_sample(sampled_pointer);
-    InterlockedExchange(&g_callsites_saturated, 1);
+    g_callsites_saturated.store(true);
     assert(insert_sample(replacement_pointer, 200, 20, nullptr));
     retire_sample(detached);
     assert(load64(&g_sample_live_bytes) == 200);
@@ -157,19 +166,68 @@ int main() {
     retire_sample(detach_sample(replacement_pointer));
     assert(load64(&g_sample_live_bytes) == 0 && g_sample_entries == 0);
     // Site registration saturation must not retain bytes freed afterward.
-    InterlockedExchange(&g_callsites_saturated, 0);
+    g_callsites_saturated.store(false);
     assert(load64(&callsite_for(10)->sample_live_bytes) == 0);
 
     // Saturation keeps existing hot sites current without registering new
     // sites or resuming unbounded full-table searches on each allocation.
     reset();
     CallsiteStat* const tracked = callsite_for(10);
-    InterlockedExchange(&g_callsites_saturated, 1);
+    g_callsites_saturated.store(true);
     record_alloc_site(10, 50, false);
     assert(load64(&tracked->requested_bytes) == 50);
     assert(callsite_for(20) == nullptr);
     record_alloc_site(10, 60, false);
     assert(load64(&tracked->requested_bytes) == 110);
+
+    // Alternating saturated misses stay in separate thread-local cache slots.
+    reset();
+    for (unsigned i = 0; i < CALLSITE_CAPACITY; ++i)
+        g_callsites[i].rva = static_cast<LONG>(0x30000000u + i);
+    g_callsites_saturated.store(true);
+    const LONG64 drops_before = load64(&g_callsite_drops);
+    for (unsigned i = 0; i < 1000; ++i) {
+        assert(!callsite_for(10));
+        assert(!callsite_for(20));
+    }
+    assert(load64(&g_callsite_drops) - drops_before == 2);
+
+    // Light request-site values are explicitly scaled estimates, not changes
+    // to native allocation sizes or to the separate exact global counters.
+    reset();
+    g_light_profile = true;
+    diagnostics::RequestSiteSampler reference(42);
+    unsigned sampled = 0;
+    for (unsigned i = 0; i < 131072; ++i) {
+        sampled += reference.take() ? 1u : 0u;
+        record_request_site(10, 64, false);
+    }
+    assert(sampled > 0);
+    CallsiteStat* estimated = callsite_for(10);
+    assert(load64(&estimated->alloc_calls) ==
+           static_cast<LONG64>(sampled) * diagnostics::REQUEST_SITE_SAMPLE_RATE);
+    assert(load64(&estimated->requested_bytes) ==
+           static_cast<LONG64>(sampled) * diagnostics::REQUEST_SITE_SAMPLE_RATE * 64);
+    reset();
+    record_alloc_site(10, static_cast<SIZE_T>(0xffffffffu), true,
+                      diagnostics::REQUEST_SITE_SAMPLE_RATE);
+    assert(load64(&callsite_for(10)->requested_bytes) ==
+           static_cast<LONG64>(0xffffffffull * diagnostics::REQUEST_SITE_SAMPLE_RATE));
+
+    // Light mode must not sample global totals, change native arguments, or
+    // bypass the identical-request retry/error-preservation path.
+    reset();
+    g_light_profile = true;
+    stages_available = 1;
+    succeed_on_call = 2;
+    const LONG64 calls_before = load64(&g_heap_alloc_calls);
+    const LONG64 bytes_before = load64(&g_heap_requested_bytes);
+    assert(profiled_heap_alloc(nullptr, HEAP_ZERO_MEMORY, 123) == replacement_pointer);
+    assert(load64(&g_heap_alloc_calls) == calls_before + 1);
+    assert(load64(&g_heap_requested_bytes) == bytes_before + 123);
+    assert(native_calls == 2 && native_size == 123 && native_flags == HEAP_ZERO_MEMORY);
+    assert(release_calls == 1 && snapshot_calls == 2);
+    assert(last_error == ERROR_ALREADY_EXISTS);
 
     reset();
     assert(insert_sample(sampled_pointer, 100, 10, nullptr));
@@ -286,5 +344,23 @@ int main() {
     insert_during_logging = true;
     log_large_allocation_history();
     assert(!insert_during_logging);
+    if (argc == 2 && !std::strcmp(argv[1], "--bench")) {
+        LARGE_INTEGER frequency;
+        assert(QueryPerformanceFrequency(&frequency));
+        for (bool light : {false, true}) {
+            reset();
+            g_light_profile = light;
+            for (unsigned i = 0; i < 32; ++i) callsite_for(0x1000 + i * 37);
+            LARGE_INTEGER begin, end;
+            QueryPerformanceCounter(&begin);
+            for (unsigned i = 0; i < 1000000; ++i)
+                record_request_site(0x1000 + (i & 31u) * 37, 64, false);
+            QueryPerformanceCounter(&end);
+            const double microseconds = static_cast<double>(end.QuadPart - begin.QuadPart) *
+                1000000.0 / static_cast<double>(frequency.QuadPart);
+            std::printf("Request-site bookkeeping only: mode=%s calls=1000000 wall_us=%.0f (not an FPS benchmark)\n",
+                light ? "light" : "full", microseconds);
+        }
+    }
     return 0;
 }

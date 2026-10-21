@@ -5,6 +5,12 @@
 > release. Its DLL identifies itself as `2.5.0-experimental.10`. Use the v2.4.2
 > GitHub release for the stable rollback build.
 
+Local development: `experimental/lag-investigation` contains an unreleased
+`2.5.0-experimental.12-dev` lower-overhead diagnostics candidate. See the
+[lag and heavy-mod investigation](docs/INVESTIGATION-2026-10-21-Lag-And-Mod-Crashes.md)
+for evidence, testing limits and controlled test instructions. It is not a
+confirmed fix for reload leaks or every heavy-mod out-of-memory crash.
+
 An experimental 32-bit proxy DLL for the Steam edition of *Men of War: Assault
 Squad 2*. It mitigates the known 2 GB lobby-allocation crash, keeps emergency
 virtual address space available for allocation recovery, preserves crash dumps,

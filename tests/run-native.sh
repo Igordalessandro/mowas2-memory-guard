@@ -23,4 +23,6 @@ fi
 "$test_build_dir/large-history-test"
 "$test_cxx" "${flags[@]}" "$project_root/tests/stable_steam_text_test.cpp" -o "$test_build_dir/steam-text-test"
 "$test_build_dir/steam-text-test"
+"$test_cxx" "${flags[@]}" "$project_root/tests/profiling_policy_test.cpp" -o "$test_build_dir/profiling-policy-test"
+"$test_build_dir/profiling-policy-test"
 echo "All native regression tests passed."

@@ -9,6 +9,7 @@
 #include <psapi.h>
 #include <cstdio>
 #include <cstdint>
+#include <atomic>
 
 namespace memory_guard {
 namespace {
@@ -70,15 +71,41 @@ static GuardRecoveryState g_recovery;
 __declspec(align(8)) static volatile LONG64 g_requestCount = 0;
 __declspec(align(8)) static volatile LONG64 g_requestedBytes = 0;
 static volatile LONG g_largestRequest = 0;
-static volatile LONG g_underPressure = 0;
+static std::atomic<bool> g_underPressure{false};
+static_assert(std::atomic<bool>::is_always_lock_free, "pressure reads must be lock-free");
 static volatile LONG g_finalProtectionLogged = 0;
+
+enum class ScanKind : unsigned { other, monitor, preflight, failure };
+struct alignas(8) ScanCost {
+    volatile LONG64 calls = 0;
+    volatile LONG64 wall_ms = 0;
+    volatile LONG64 queries = 0;
+    std::atomic<DWORD> longest_ms{0};
+};
+static ScanCost g_scanCosts[4];
+
+static void log_scan_costs() {
+    for (unsigned i = 0; i < 4; ++i) {
+        static const char* const names[] = {"other", "monitor", "preflight", "failure"};
+        ScanCost& cost = g_scanCosts[i];
+        const LONG64 calls = InterlockedCompareExchange64(&cost.calls, 0, 0);
+        if (!calls) continue;
+        logger::log("VA SCAN COST : kind=%s calls=%lld wall_ms=%lld max_ms=%lu queries=%lld (wall includes scheduling)",
+            names[i], static_cast<long long>(calls),
+            static_cast<long long>(InterlockedCompareExchange64(&cost.wall_ms, 0, 0)),
+            static_cast<unsigned long>(cost.longest_ms.load(std::memory_order_relaxed)),
+            static_cast<long long>(InterlockedCompareExchange64(&cost.queries, 0, 0)));
+    }
+}
 
 struct PreserveLastError {
     DWORD error = GetLastError();
     ~PreserveLastError() { SetLastError(error); }
 };
 
-static AddressSpaceSnapshot scan_address_space() {
+static AddressSpaceSnapshot scan_address_space(ScanKind kind = ScanKind::other) {
+    const DWORD started = GetTickCount();
+    LONG64 queries = 0;
     AddressSpaceSnapshot result = {};
     SYSTEM_INFO si = {};
     GetSystemInfo(&si);
@@ -89,6 +116,7 @@ static AddressSpaceSnapshot scan_address_space() {
     const std::uint64_t limit = reinterpret_cast<std::uintptr_t>(si.lpMaximumApplicationAddress);
 
     while (cursor <= limit) {
+        ++queries;
         MEMORY_BASIC_INFORMATION mbi = {};
         SIZE_T queried = VirtualQuery(reinterpret_cast<LPCVOID>(
             static_cast<std::uintptr_t>(cursor)), &mbi, sizeof(mbi));
@@ -119,6 +147,14 @@ static AddressSpaceSnapshot scan_address_space() {
         }
         cursor = next;
     }
+    const DWORD elapsed = GetTickCount() - started;
+    ScanCost& cost = g_scanCosts[static_cast<unsigned>(kind)];
+    InterlockedIncrement64(&cost.calls);
+    InterlockedExchangeAdd64(&cost.wall_ms, elapsed);
+    InterlockedExchangeAdd64(&cost.queries, queries);
+    DWORD longest = cost.longest_ms.load(std::memory_order_relaxed);
+    while (longest < elapsed && !cost.longest_ms.compare_exchange_weak(
+        longest, elapsed, std::memory_order_relaxed)) {}
     return result;
 }
 
@@ -274,6 +310,15 @@ static void log_snapshot(const AddressSpaceSnapshot& snapshot, bool low) {
         largest / 1024,
         have_process ? static_cast<unsigned long long>(pmc.PrivateUsage) / MiB : 0ull,
         have_process ? static_cast<unsigned long long>(pmc.WorkingSetSize) / MiB : 0ull);
+    MEMORYSTATUSEX system_memory = {};
+    system_memory.dwLength = sizeof(system_memory);
+    if (GlobalMemoryStatusEx(&system_memory)) {
+        logger::log("SYSTEM MEMORY : available_phys=%lluMiB total_phys=%lluMiB page_faults=%lu (soft+hard)",
+            static_cast<unsigned long long>(system_memory.ullAvailPhys) / MiB,
+            static_cast<unsigned long long>(system_memory.ullTotalPhys) / MiB,
+            have_process ? static_cast<unsigned long>(pmc.PageFaultCount) : 0ul);
+    }
+    log_scan_costs();
     logger::log("MEM HOLES : fit4/8/16/32MiB=%lu/%lu/%lu/%lu complete=%u",
                 static_cast<unsigned long>(snapshot.holes.counts[0]),
                 static_cast<unsigned long>(snapshot.holes.counts[1]),
@@ -308,7 +353,7 @@ static DWORD WINAPI monitor_thread(LPVOID) {
     DWORD interval = MONITOR_INTERVAL_MS;
     for (;;) {
         Sleep(interval);
-        AddressSpaceSnapshot snapshot = scan_address_space();
+        AddressSpaceSnapshot snapshot = scan_address_space(ScanKind::monitor);
 
         const bool low = snapshot.free_bytes < static_cast<unsigned long long>(RELEASE_TOTAL_FREE_MB) * MiB ||
                          snapshot.largest_free < static_cast<SIZE_T>(RELEASE_LARGEST_FREE_MB) * MiB;
@@ -319,7 +364,7 @@ static DWORD WINAPI monitor_thread(LPVOID) {
             snapshot.largest_free < static_cast<SIZE_T>(FINAL_LARGEST_FREE_MB) * MiB;
         const bool diagnostic_pressure =
             snapshot.free_bytes < 256ull * MiB || snapshot.largest_free < 64u * MiB;
-        InterlockedExchange(&g_underPressure, diagnostic_pressure ? 1 : 0);
+        g_underPressure.store(diagnostic_pressure, std::memory_order_relaxed);
         interval = diagnostic_pressure ? CRITICAL_MONITOR_INTERVAL_MS : MONITOR_INTERVAL_MS;
 
         if (low) release_primary(RELEASE_LOW_ADDRESS_SPACE);
@@ -514,6 +559,10 @@ bool install() {
 
 void before_allocation(std::size_t size, std::uintptr_t caller_rva) {
     if (size < 8u * 1024u * 1024u) return;
+    // No preflight stage remains to release. A protected recovery reserve is
+    // intentionally NOT a preflight stage. Native failures still get a fresh
+    // scan and the same staged retry/recovery path as before.
+    if (!g_primaryReserve && !g_criticalReserve && !g_finalReserve) return;
     PreserveLastError preserve_error;
 
     const unsigned long long margin =
@@ -529,7 +578,7 @@ void before_allocation(std::size_t size, std::uintptr_t caller_rva) {
                snapshot.largest_free >= needed_largest;
     };
 
-    AddressSpaceSnapshot snapshot = scan_address_space();
+    AddressSpaceSnapshot snapshot = scan_address_space(ScanKind::preflight);
     if (has_headroom(snapshot)) return;
 
     // The reserve blocks are allocated next to one another at startup. Release
@@ -539,29 +588,30 @@ void before_allocation(std::size_t size, std::uintptr_t caller_rva) {
     // The separate recovery block is deliberately not released by preflight;
     // it remains available for a later observed allocation failure.
     if (release_primary(RELEASE_LARGE_REQUEST)) {
-        const AddressSpaceSnapshot after = scan_address_space();
+        const AddressSpaceSnapshot after = scan_address_space(ScanKind::preflight);
         log_preflight_release("primary", size, caller_rva, snapshot, after);
         snapshot = after;
         if (has_headroom(snapshot)) return;
     }
     if (release_critical(RELEASE_LARGE_REQUEST)) {
-        const AddressSpaceSnapshot after = scan_address_space();
+        const AddressSpaceSnapshot after = scan_address_space(ScanKind::preflight);
         log_preflight_release("critical", size, caller_rva, snapshot, after);
         snapshot = after;
         if (has_headroom(snapshot)) return;
     }
     if (release_final(RELEASE_LARGE_REQUEST)) {
         log_preflight_release("final", size, caller_rva,
-                              snapshot, scan_address_space());
+                              snapshot, scan_address_space(ScanKind::preflight));
     }
 }
 
 void capture_failure_snapshot(const char* api, std::size_t bytes,
                               std::uintptr_t caller_rva, const char* phase) {
     PreserveLastError preserve_error;
-    const AddressSpaceSnapshot snapshot = scan_address_space();
+    const AddressSpaceSnapshot snapshot = scan_address_space(ScanKind::failure);
     const unsigned long guard = guard_mib();
     const DWORD tick = GetTickCount();
+    log_scan_costs();
     logger::log(
         "MEM FAILURE SNAPSHOT : api=%s bytes=%zu site=+%08lX phase=%s thread=%lu tick=%lu "
         "free=%lluKiB largest=%lluKiB committed=%lluMiB reserved=%lluMiB guard=%luMiB "
@@ -609,7 +659,7 @@ void rearm_recovery_if_needed() {
 }
 
 bool is_under_pressure() {
-    return InterlockedCompareExchange(&g_underPressure, 0, 0) != 0;
+    return g_underPressure.load(std::memory_order_relaxed);
 }
 
 void record_request(std::size_t size) {

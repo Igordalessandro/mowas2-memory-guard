@@ -3,6 +3,7 @@
 #include "app/config.h"
 #include "diagnostics/retry_policy.h"
 #include "diagnostics/large_allocation_history.h"
+#include "diagnostics/profiling_policy.h"
 #include "orchestration/memory_guard.h"
 #include "shared/core/module.h"
 #include "shared/logging/logger.h"
@@ -12,6 +13,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <atomic>
 
 namespace allocator_profiler {
 namespace {
@@ -110,9 +112,11 @@ struct alignas(8) FlightEvent {
 };
 
 static CallsiteStat g_callsites[CALLSITE_CAPACITY] = {};
-static thread_local bool g_callsite_cache_valid = false;
-static thread_local DWORD g_cached_callsite_rva = 0;
-static thread_local CallsiteStat* g_cached_callsite = nullptr;
+static thread_local diagnostics::CallerCache<CallsiteStat*> g_callsite_cache;
+static thread_local diagnostics::RequestSiteSampler g_request_site_sampler;
+static thread_local bool g_request_site_sampler_ready = false;
+// Selected once before hooks are published; never toggled in a running game.
+static bool g_light_profile = true;
 static SampleEntry g_samples[SAMPLE_CAPACITY] = {};
 static HeapStat g_heaps[HEAP_CAPACITY] = {};
 static FlightEvent g_flight[FLIGHT_CAPACITY] = {};
@@ -128,7 +132,7 @@ static volatile LONG g_sample_lock = 0;
 static volatile LONG g_flight_sequence = 0;
 static volatile LONG g_sample_entries = 0;
 static volatile LONG g_sample_drops = 0;
-static volatile LONG g_callsites_saturated = 0;
+static std::atomic<bool> g_callsites_saturated{false};
 alignas(8) static volatile LONG64 g_callsite_drops = 0;
 
 alignas(8) static volatile LONG64 g_heap_alloc_calls = 0;
@@ -269,14 +273,13 @@ static void record_flight_event(SIZE_T size, DWORD caller_rva_value, void* resul
 
 static CallsiteStat* callsite_for(DWORD rva) {
     // Keep frequent sites current even after the fixed table fills. Cache the
-    // hot caller per thread; saturated misses search at most 16 slots instead
+    // hot callers per thread; saturated misses search at most 16 slots instead
     // of returning stale retained totals or probing 1024 slots per call.
-    if (g_callsite_cache_valid && g_cached_callsite_rva == rva) return g_cached_callsite;
-    const bool saturated = InterlockedCompareExchange(&g_callsites_saturated, 0, 0) != 0;
+    CallsiteStat* cached = nullptr;
+    if (g_callsite_cache.lookup(rva, cached)) return cached;
+    const bool saturated = g_callsites_saturated.load(std::memory_order_relaxed);
     auto remember = [rva](CallsiteStat* site) {
-        g_cached_callsite_rva = rva;
-        g_cached_callsite = site;
-        g_callsite_cache_valid = true;
+        g_callsite_cache.remember(rva, site);
         return site;
     };
 
@@ -296,16 +299,28 @@ static CallsiteStat* callsite_for(DWORD rva) {
         }
     }
     InterlockedIncrement64(&g_callsite_drops);
-    InterlockedExchange(&g_callsites_saturated, 1);
+    g_callsites_saturated.store(true, std::memory_order_relaxed);
     return remember(nullptr);
 }
 
-static void record_alloc_site(DWORD rva, SIZE_T size, bool realloc_call) {
+static void record_alloc_site(DWORD rva, SIZE_T size, bool realloc_call, unsigned weight = 1) {
     CallsiteStat* site = callsite_for(rva);
     if (!site) return;
-    if (realloc_call) InterlockedIncrement64(&site->realloc_calls);
-    else InterlockedIncrement64(&site->alloc_calls);
-    InterlockedExchangeAdd64(&site->requested_bytes, static_cast<LONG64>(size));
+    if (realloc_call) InterlockedExchangeAdd64(&site->realloc_calls, weight);
+    else InterlockedExchangeAdd64(&site->alloc_calls, weight);
+    InterlockedExchangeAdd64(&site->requested_bytes,
+        static_cast<LONG64>(static_cast<unsigned long long>(size) * weight));
+}
+
+static void record_request_site(DWORD rva, SIZE_T size, bool realloc_call) {
+    if (!g_light_profile) { record_alloc_site(rva, size, realloc_call); return; }
+    if (!g_request_site_sampler_ready) {
+        g_request_site_sampler = diagnostics::RequestSiteSampler(GetCurrentThreadId());
+        g_request_site_sampler_ready = true;
+    }
+    if (g_request_site_sampler.take()) {
+        record_alloc_site(rva, size, realloc_call, diagnostics::REQUEST_SITE_SAMPLE_RATE);
+    }
 }
 
 static void record_free_site(DWORD rva) {
@@ -475,7 +490,7 @@ static LPVOID WINAPI profiled_heap_alloc(HANDLE heap, DWORD flags, SIZE_T size) 
     if (g_engine_context_active) g_engine_context_heap = heap;
     InterlockedIncrement64(&g_heap_alloc_calls);
     InterlockedExchangeAdd64(&g_heap_requested_bytes, static_cast<LONG64>(size));
-    record_alloc_site(rva, size, false);
+    record_request_site(rva, size, false);
 
     SetLastError(incoming_error);
     LPVOID result = g_originalHeapAlloc(heap, flags, size);
@@ -530,7 +545,7 @@ static LPVOID WINAPI profiled_heap_realloc(HANDLE heap, DWORD flags,
     if (g_engine_context_active) g_engine_context_heap = heap;
     InterlockedIncrement64(&g_heap_realloc_calls);
     InterlockedExchangeAdd64(&g_heap_requested_bytes, static_cast<LONG64>(size));
-    record_alloc_site(rva, size, true);
+    record_request_site(rva, size, true);
 
     // Remove the old identity before the heap can reuse its address. Keep the
     // record private until the native result tells us to retire or restore it.
@@ -939,7 +954,7 @@ void log_summary(bool detailed) {
         ? static_cast<unsigned long long>(sampled_live) * SAMPLE_RATE : 0ull;
 
     logger::log(
-        "ALLOC PROFILE : heap alloc=%lld realloc=%lld free=%lld failures=%ld requested=%llu MiB | virtual alloc=%lld free=%lld failures=%ld requested=%llu MiB | samples=%ld live=%llu KiB estimate=%llu MiB drops=%ld sites_dropped=%lld sites_saturated=%ld",
+        "ALLOC PROFILE : heap alloc=%lld realloc=%lld free=%lld failures=%ld requested=%llu MiB | virtual alloc=%lld free=%lld failures=%ld requested=%llu MiB | samples=%ld live=%llu KiB estimate=%llu MiB drops=%ld sites_dropped=%lld sites_saturated=%ld mode=%s request_site_rate=1/%u",
         static_cast<long long>(load64(&g_heap_alloc_calls)),
         static_cast<long long>(load64(&g_heap_realloc_calls)),
         static_cast<long long>(load64(&g_heap_free_calls)),
@@ -954,9 +969,11 @@ void log_summary(bool detailed) {
         estimated_live / MiB,
         static_cast<long>(g_sample_drops),
         static_cast<long long>(load64(&g_callsite_drops)),
-        static_cast<long>(InterlockedCompareExchange(&g_callsites_saturated, 0, 0)));
+        static_cast<long>(g_callsites_saturated.load(std::memory_order_relaxed)),
+        g_light_profile ? "light" : "full",
+        g_light_profile ? diagnostics::REQUEST_SITE_SAMPLE_RATE : 1u);
     logger::report_allocator(
-        "alloc calls=%lld realloc=%lld free=%lld fail=%ld requested=%lluMiB sampled_live_est=%lluMiB drops=%ld sites_saturated=%ld",
+        "alloc calls=%lld realloc=%lld free=%lld fail=%ld requested=%lluMiB sampled_live_est=%lluMiB drops=%ld sites_saturated=%ld mode=%s",
         static_cast<long long>(load64(&g_heap_alloc_calls)),
         static_cast<long long>(load64(&g_heap_realloc_calls)),
         static_cast<long long>(load64(&g_heap_free_calls)),
@@ -964,7 +981,8 @@ void log_summary(bool detailed) {
         static_cast<unsigned long long>(load64(&g_heap_requested_bytes)) / MiB,
         estimated_live / MiB,
         static_cast<long>(g_sample_drops),
-        static_cast<long>(InterlockedCompareExchange(&g_callsites_saturated, 0, 0)));
+        static_cast<long>(g_callsites_saturated.load(std::memory_order_relaxed)),
+        g_light_profile ? "light" : "full");
 
     if (!detailed) return;
     constexpr unsigned TOP_COUNT = 6;
@@ -996,7 +1014,8 @@ void log_summary(bool detailed) {
 
     if (top_requested[0].requested > 0 || top_live[0].sample_live > 0) {
         logger::report_hotspot(
-            "hot req=+%08lX/%lluMiB/%lldcalls retained=+%08lX/%lluMiB/%ldblocks",
+            "hot %s=+%08lX/%lluMiB/%lldcalls retained=+%08lX/%lluMiB/%ldblocks",
+            g_light_profile ? "req_est" : "req",
             static_cast<unsigned long>(top_requested[0].rva),
             static_cast<unsigned long long>(top_requested[0].requested) / MiB,
             static_cast<long long>(top_requested[0].calls),
@@ -1008,8 +1027,8 @@ void log_summary(bool detailed) {
     for (unsigned i = 0; i < TOP_COUNT && top_requested[i].requested > 0; ++i) {
         const RankedSite& site = top_requested[i];
         logger::log(
-            "ALLOC TOP REQUEST #%u : mowas_2.exe+0x%08lX calls=%lld requested=%llu MiB sample_live=%llu KiB",
-            i + 1,
+            "ALLOC TOP REQUEST%s #%u : mowas_2.exe+0x%08lX calls=%lld requested=%llu MiB sample_live=%llu KiB",
+            g_light_profile ? " EST" : "", i + 1,
             static_cast<unsigned long>(site.rva),
             static_cast<long long>(site.calls),
             static_cast<unsigned long long>(site.requested) / MiB,
@@ -1070,6 +1089,13 @@ void log_summary(bool detailed) {
 }
 
 bool install(std::uintptr_t game_base) {
+    char mode_text[16] = {};
+    const DWORD mode_length = GetEnvironmentVariableA("MOWAS2_PROFILE_MODE", mode_text, sizeof(mode_text));
+    const auto mode = mode_length >= sizeof(mode_text)
+        ? diagnostics::ProfileMode::invalid : diagnostics::profile_mode(mode_text);
+    g_light_profile = mode == diagnostics::ProfileMode::light;
+    if (mode == diagnostics::ProfileMode::invalid)
+        logger::log("ALLOC PROFILER : invalid MOWAS2_PROFILE_MODE; using full diagnostics");
     g_base = game_base;
     IatPatch patches[] = {
         {"HeapAlloc", reinterpret_cast<void*>(&profiled_heap_alloc),
@@ -1116,7 +1142,9 @@ bool install(std::uintptr_t game_base) {
 
     InterlockedExchange(&g_installed, 1);
     logger::log(
-        "ALLOC PROFILER installed: game-only IAT observation, 1/%u lifetime sampling, 1/%u engine sampling, original allocators retained",
+        "ALLOC PROFILER installed: mode=%s request-site=1/%u, 1/%u lifetime sampling, 1/%u engine sampling, original allocators and failure recovery retained",
+        g_light_profile ? "light" : "full",
+        g_light_profile ? diagnostics::REQUEST_SITE_SAMPLE_RATE : 1u,
         SAMPLE_RATE, ENGINE_SAMPLE_RATE);
     return true;
 }

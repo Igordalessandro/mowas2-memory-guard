@@ -21,11 +21,17 @@ DWORD maximum_address = 0x0fffffffu;
 unsigned queries = 0;
 unsigned releases = 0;
 bool fail_query = false;
+DWORD fake_tick = 1234567;
+DWORD tick_step = 0;
 
 DWORD WINAPI mock_get_last_error() { return test_error; }
 void WINAPI mock_set_last_error(DWORD error) { test_error = error; }
 DWORD WINAPI mock_thread_id() { return 17; }
-DWORD WINAPI mock_tick() { return 1234567; }
+DWORD WINAPI mock_tick() {
+    const DWORD result = fake_tick;
+    fake_tick += tick_step;
+    return result;
+}
 void WINAPI mock_system_info(LPSYSTEM_INFO info) {
     *info = {};
     info->lpMinimumApplicationAddress = reinterpret_cast<void*>(0x10000);
@@ -123,6 +129,12 @@ void setup() {
     failure_memory.clear();
     releases = queries = 0;
     fail_query = false;
+    fake_tick = 1234567;
+    tick_step = 0;
+    for (auto& cost : g_scanCosts) {
+        cost.calls = cost.wall_ms = cost.queries = 0;
+        cost.longest_ms.store(0);
+    }
     maximum_address = 0x0fffffffu;
     g_primaryReserveSize = 8 * TestMiB;
     g_criticalReserveSize = 8 * TestMiB;
@@ -157,8 +169,11 @@ int main() {
     assert(messages[0].find("stage=primary bytes=20971539 site=+00376136 thread=17 tick=1234567") != std::string::npos);
     assert(messages[0].find("before_free=4096KiB before_largest=4096KiB after_free=12288KiB after_largest=8192KiB") != std::string::npos);
     assert(messages[2].find("stage=final") != std::string::npos);
+    const unsigned after_preflight = queries;
     before_allocation(20 * TestMiB + 19, 0x9999);
-    assert(messages.size() == 3 && releases == 3);
+    assert(messages.size() == 3 && releases == 3 && queries == after_preflight);
+    assert(g_recovery.snapshot().reserve.bytes == 32 * TestMiB);
+    assert(g_scanCosts[static_cast<unsigned>(ScanKind::preflight)].calls == 4);
 
     // The monitor may restore the primary stage after sustained recovery.
     // Its next real release must retain the new triggering caller as well.
@@ -171,6 +186,7 @@ int main() {
     assert(messages.back().find("stage=primary bytes=62914560 site=+0088ABCD") != std::string::npos);
 
     capture_failure_snapshot("HeapAlloc", 16777235, 0x00376136, "initial");
+    assert(g_scanCosts[static_cast<unsigned>(ScanKind::failure)].calls == 1);
     assert(test_error == 0xbeef);
     assert(messages.back().find("api=HeapAlloc bytes=16777235 site=+00376136 phase=initial") != std::string::npos);
     assert(messages.back().find("fit4/8/16/32MiB=2/1/1/1 complete=1") != std::string::npos);
@@ -202,5 +218,23 @@ int main() {
     assert(misaligned.holes.counts[0] == 0);
     log_snapshot(misaligned, false);
     assert(messages.back().find("MEM HOLES : fit4/8/16/32MiB=0/0/0/0 complete=1") != std::string::npos);
+    bool saw_cost = false;
+    for (const auto& message : messages)
+        if (message.find("VA SCAN COST : kind=other calls=1") != std::string::npos) saw_cost = true;
+    assert(saw_cost);
+    g_underPressure.store(true);
+    assert(is_under_pressure());
+    g_underPressure.store(false);
+    assert(!is_under_pressure());
+    // DWORD timer wrap is modular; aggregate timings/call totals remain 64-bit.
+    setup();
+    fake_tick = 0xfffffff8u;
+    tick_step = 16;
+    scan_address_space(ScanKind::preflight);
+    auto& cost = g_scanCosts[static_cast<unsigned>(ScanKind::preflight)];
+    assert(cost.calls == 1 && cost.wall_ms == 16 && cost.longest_ms.load() == 16);
+    tick_step = 2;
+    scan_address_space(ScanKind::preflight);
+    assert(cost.calls == 2 && cost.wall_ms == 18 && cost.longest_ms.load() == 16);
     return 0;
 }
