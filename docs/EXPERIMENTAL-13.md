@@ -1,19 +1,19 @@
-# Experimental.13 — lighter profiling, retained diagnostics
+# Experimental.13 — full profiling and expanded diagnostics
 
-Prepared at the user's request on 2026-10-21. Branch:
+Corrected at the user's request on 2026-10-21. Branch:
 `experimental/v2.5.0-experimental.13`. This is a local build, not yet installed
 on either PC or published on GitHub. Stable 2.4.2 is unchanged.
 
 ## Contents
 
-This version carries forward **all** additions from the unreleased
-experimental.12-dev candidate. That candidate already implemented light
-profiling; .13 gives the requested combination its own version and artifact,
-without inventing a further allocator change or reducing recovery safeguards.
+The first local .13 candidate inherited light profiling from .12. The user
+subsequently clarified that this was a mistake. The corrected .13 removes
+the request-site sampler, weighted estimates, mode selector and light/full
+benchmark, while retaining the other .12 additions and recovery safeguards.
 
-- Light request-site profiling is the default: approximately 1 in 1024
-  requests contributes scaled caller-site estimates, clearly labelled
-  `ALLOC TOP REQUEST EST` / `req_est`.
+- Every observed heap allocation/reallocation request contributes its actual
+  count and byte size to its registered caller site, not a scaled estimate.
+  Rankings use `ALLOC TOP REQUEST` and compact `hot req`, not `EST` / `req_est`.
 - Global allocation/free counts and requested-byte totals remain exact.
   Lifetime samples, retained-allocation samples, engine caller samples,
   failure snapshots and both allocation histories remain available.
@@ -44,38 +44,46 @@ or that lowering diagnostic overhead fixes it. The
 [investigation record](INVESTIGATION-2026-10-21-Lag-And-Mod-Crashes.md) separates
 evidence from hypotheses about reload accumulation and duplicate mod versions.
 
-## Selecting profiling mode
+## Profiling behavior
 
-No new launch flag is required for light profiling. On startup, the full log
-should contain `ALLOC PROFILER installed: mode=light request-site=1/1024`.
+Full per-request site accounting is always enabled. The startup log identifies
+`ALLOC PROFILER installed: mode=full request-site=1/1`; periodic profiles
+identify `mode=full request_site_rate=1/1`. No new launch flag is required.
 
-For diagnostic comparison, `MOWAS2_PROFILE_MODE=full` restores per-request
-caller-site accounting. `MOWAS2_PROFILE_MODE=light` explicitly selects the
-default. The setting is read once before hook installation; a restart is
-required. Invalid or overlong values fall back to full with a warning.
+`MOWAS2_PROFILE_MODE` is no longer read. Even a previously configured `light`
+value cannot enable light profiling. Existing Proton settings, the dbghelp
+override and `%command%` must be preserved; no installed launch options were
+changed during this correction.
 
-On Proton, prepend the setting to existing Steam launch options and preserve
-the existing Proton settings, `WINEDLLOVERRIDES` and `%command%`. On Windows,
-set it in the environment inherited by the game; a running Steam client may
-need restarting to inherit a changed variable. Do not replace unrelated launch
-options, disable safety guards or install into a running game.
+"Full" restores per-request site accounting, not unlimited tracking of every
+pointer. The pre-existing lifetime/free-site sampling and engine sampling are
+unchanged. The fixed site table can still saturate, making per-site coverage
+incomplete; global totals continue independently. Caching and advisory atomic
+read optimizations do not sample away accounting.
 
 ## Build and validation record
 
-Artifact: `dist/v2.5.0-experimental.13/dbghelp.dll`, PE32/x86. It exports only
-`ImageNtHeader` and `MiniDumpWriteDump` and embeds version
-`2.5.0-experimental.13`. SHA-256:
+Corrected artifact: `dist/v2.5.0-experimental.13/dbghelp.dll`, PE32/x86,
+exporting only `ImageNtHeader` and `MiniDumpWriteDump`. SHA-256:
 
-`63c1604da8064ef3017705024fe273c5dc51f69c1a344864f64dddfc2bd071bd`
+`f4d2ebab75e63943a751a9a828f83c6b07c37a3e886cb03df7e08c5445482fcb`
 
 - All seven portable regression suites passed with ASan/UBSan.
-- All sixteen Windows x86 regression executables were freshly compiled with
-  strict warnings and passed under isolated Wine 11.19 (Staging). The tests
-  do not start Steam or the game, or touch either installed game prefix.
-- Source/test comparison with the .12 checkpoint confirms the version string
-  is the only production-code difference: all .12 functionality is retained.
-- `git diff --check` passed. The .12 artifact was preserved, and the local
-  installed DLL still matches the previously deployed .11-dev artifact.
+- All sixteen freshly compiled Windows x86 regression executables passed
+  under isolated Wine 11.19 (Staging), with strict compilation warnings.
+- Regressions check 131,072 consecutive requests are counted exactly, request
+  bytes accumulate beyond 32 bits, retries do not double-count requests, and
+  request-site output no longer carries scaled-estimate labels.
+- Binary inspection confirms the full-mode startup marker and the absence
+  of the removed mode-setting name, `mode=light` and `req_est`.
+- `git diff --check` passed. Recovery, VAC, compatibility and orchestration
+  source files are unchanged by this correction. The isolated temporary Wine
+  prefix was cleaned up after its own server exited.
+
+The earlier light-mode artifact (SHA-256
+`63c1604da8064ef3017705024fe273c5dc51f69c1a344864f64dddfc2bd071bd`)
+was preserved at `dist/v2.5.0-experimental.13-light-superseded/dbghelp.dll`.
+It is superseded, not the version to deploy. No public release ever used it.
 
 Native-Windows runtime and real gameplay/slow-motion validation remain
 outstanding. Neither deployment nor GitHub publication is part of preparing

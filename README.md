@@ -5,8 +5,8 @@
 > the public stable release. Use the v2.4.2 GitHub release for stable rollback.
 
 Local development: [experimental.13](docs/EXPERIMENTAL-13.md) carries forward
-all of the unreleased .12 candidate's additions, with lighter request-site
-profiling enabled by default. See the
+the unreleased .12 candidate's diagnostics and caching additions, with full
+per-request site profiling. The light-mode option has been removed. See the
 [lag and heavy-mod investigation](docs/INVESTIGATION-2026-10-21-Lag-And-Mod-Crashes.md)
 for evidence and controlled test instructions. It is not a confirmed fix for
 slow motion, reload leaks or every heavy-mod out-of-memory crash.

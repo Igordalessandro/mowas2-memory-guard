@@ -1,7 +1,6 @@
 #pragma once
 #include <cstddef>
 #include <cstdint>
-#include <cstring>
 
 namespace diagnostics {
 // Thread-owned, fixed-size cache. A valid null value caches a saturated-table
@@ -28,25 +27,4 @@ public:
     void clear() { for (auto& entry : entries_) entry = {}; }
 };
 
-constexpr unsigned REQUEST_SITE_SAMPLE_RATE = 1024;
-// Independent request sampling avoids synchronizing on every successful
-// allocation. The pointer-based lifetime cohort is deliberately unchanged.
-class RequestSiteSampler {
-    std::uint32_t state_;
-public:
-    explicit RequestSiteSampler(std::uint32_t seed = 0x6d2b79f5u)
-        : state_(seed ? seed : 0x6d2b79f5u) {}
-    bool take() {
-        state_ ^= state_ << 13;
-        state_ ^= state_ >> 17;
-        state_ ^= state_ << 5;
-        return (state_ & (REQUEST_SITE_SAMPLE_RATE - 1u)) == 0;
-    }
-};
-enum class ProfileMode { light, full, invalid };
-inline ProfileMode profile_mode(const char* text) {
-    if (!text || !*text || !std::strcmp(text, "light")) return ProfileMode::light;
-    if (!std::strcmp(text, "full")) return ProfileMode::full;
-    return ProfileMode::invalid;
-}
 } // namespace diagnostics

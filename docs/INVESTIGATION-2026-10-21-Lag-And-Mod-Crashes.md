@@ -1,5 +1,10 @@
 # Slow motion, repeated loads and heavy-mod exhaustion — 2026-10-21
 
+Historical .12 investigation: the light-mode proposal below was subsequently
+removed at the user's request from the corrected
+[experimental.13 build](EXPERIMENTAL-13.md). Its caching, scan diagnostics and
+other additions remain; .13 uses full per-request site accounting only.
+
 Status: local `experimental/lag-investigation` work; candidate
 `2.5.0-experimental.12-dev`. Not a public release or a confirmed gameplay fix.
 Neither installed game was changed during this investigation. Public stable

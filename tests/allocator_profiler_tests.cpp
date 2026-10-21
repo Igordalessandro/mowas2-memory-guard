@@ -6,7 +6,6 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
-#include <initializer_list>
 
 namespace {
 DWORD last_error = 0;
@@ -39,6 +38,8 @@ unsigned snapshot_native_calls[2] = {};
 char snapshot_phases[2][16] = {};
 DWORD snapshot_errors[2] = {};
 bool insert_during_logging = false;
+bool saw_full_profile = false;
+bool saw_full_request_site = false;
 }
 
 namespace memory_guard {
@@ -63,7 +64,11 @@ void capture_failure_snapshot(const char*, std::size_t, std::uintptr_t, const ch
 }
 namespace core { void register_module(const ModuleSpec&) {} }
 namespace logger {
-void log(const char*, ...) {
+void log(const char* format, ...) {
+    assert(!std::strstr(format, "mode=light"));
+    assert(!std::strstr(format, "ALLOC TOP REQUEST EST"));
+    if (std::strstr(format, "mode=full request_site_rate=1/1")) saw_full_profile = true;
+    if (std::strstr(format, "ALLOC TOP REQUEST #")) saw_full_request_site = true;
     if (insert_during_logging) {
         // A producer must remain free to acquire the history lock while a
         // copied snapshot is logged; logging while holding it deadlocks.
@@ -82,7 +87,10 @@ void report_failure(const char* format, ...) {
     last_error = 0xBAD;
 }
 void report_allocator(const char*, ...) { last_error = 0xBAD; }
-void report_hotspot(const char*, ...) { last_error = 0xBAD; }
+void report_hotspot(const char* format, ...) {
+    assert(!std::strstr(format, "req_est"));
+    last_error = 0xBAD;
+}
 void flush_now() { last_error = 0xBAD; }
 }
 
@@ -124,9 +132,6 @@ void reset() {
     g_callsites_saturated.store(false);
     g_sample_entries = g_sample_drops = 0;
     g_callsite_cache.clear();
-    g_light_profile = false;
-    g_request_site_sampler = diagnostics::RequestSiteSampler(42);
-    g_request_site_sampler_ready = true;
     g_sample_live_bytes = 0;
     g_engine_context_active = true;
     g_engine_context_rva = 10;
@@ -145,7 +150,7 @@ void reset() {
 }
 }
 
-int main(int argc, char** argv) {
+int main() {
     using namespace allocator_profiler;
     // Synthetic addresses are only identities, never dereferenced.
     for (std::uintptr_t address = 16; !replacement_pointer; address += 16) {
@@ -192,32 +197,27 @@ int main(int argc, char** argv) {
     }
     assert(load64(&g_callsite_drops) - drops_before == 2);
 
-    // Light request-site values are explicitly scaled estimates, not changes
-    // to native allocation sizes or to the separate exact global counters.
+    // Every request contributes its exact count and size to a tracked site;
+    // request-site sampling/weighting must not silently return.
     reset();
-    g_light_profile = true;
-    diagnostics::RequestSiteSampler reference(42);
-    unsigned sampled = 0;
     for (unsigned i = 0; i < 131072; ++i) {
-        sampled += reference.take() ? 1u : 0u;
-        record_request_site(10, 64, false);
+        record_alloc_site(10, 64, false);
     }
-    assert(sampled > 0);
-    CallsiteStat* estimated = callsite_for(10);
-    assert(load64(&estimated->alloc_calls) ==
-           static_cast<LONG64>(sampled) * diagnostics::REQUEST_SITE_SAMPLE_RATE);
-    assert(load64(&estimated->requested_bytes) ==
-           static_cast<LONG64>(sampled) * diagnostics::REQUEST_SITE_SAMPLE_RATE * 64);
+    CallsiteStat* exact = callsite_for(10);
+    assert(load64(&exact->alloc_calls) == 131072);
+    assert(load64(&exact->requested_bytes) == 131072ll * 64);
+    log_summary(true);
+    assert(saw_full_profile && saw_full_request_site);
     reset();
-    record_alloc_site(10, static_cast<SIZE_T>(0xffffffffu), true,
-                      diagnostics::REQUEST_SITE_SAMPLE_RATE);
+    record_alloc_site(10, static_cast<SIZE_T>(0xffffffffu), true);
+    record_alloc_site(10, static_cast<SIZE_T>(0xffffffffu), true);
+    assert(load64(&callsite_for(10)->realloc_calls) == 2);
     assert(load64(&callsite_for(10)->requested_bytes) ==
-           static_cast<LONG64>(0xffffffffull * diagnostics::REQUEST_SITE_SAMPLE_RATE));
+           static_cast<LONG64>(0xffffffffull * 2));
 
-    // Light mode must not sample global totals, change native arguments, or
-    // bypass the identical-request retry/error-preservation path.
+    // Global totals and site accounting must not double-count native retries
+    // or change native arguments/error-preservation behavior.
     reset();
-    g_light_profile = true;
     stages_available = 1;
     succeed_on_call = 2;
     const LONG64 calls_before = load64(&g_heap_alloc_calls);
@@ -225,6 +225,8 @@ int main(int argc, char** argv) {
     assert(profiled_heap_alloc(nullptr, HEAP_ZERO_MEMORY, 123) == replacement_pointer);
     assert(load64(&g_heap_alloc_calls) == calls_before + 1);
     assert(load64(&g_heap_requested_bytes) == bytes_before + 123);
+    assert(load64(&callsite_for(10)->alloc_calls) == 1);
+    assert(load64(&callsite_for(10)->requested_bytes) == 123);
     assert(native_calls == 2 && native_size == 123 && native_flags == HEAP_ZERO_MEMORY);
     assert(release_calls == 1 && snapshot_calls == 2);
     assert(last_error == ERROR_ALREADY_EXISTS);
@@ -344,23 +346,5 @@ int main(int argc, char** argv) {
     insert_during_logging = true;
     log_large_allocation_history();
     assert(!insert_during_logging);
-    if (argc == 2 && !std::strcmp(argv[1], "--bench")) {
-        LARGE_INTEGER frequency;
-        assert(QueryPerformanceFrequency(&frequency));
-        for (bool light : {false, true}) {
-            reset();
-            g_light_profile = light;
-            for (unsigned i = 0; i < 32; ++i) callsite_for(0x1000 + i * 37);
-            LARGE_INTEGER begin, end;
-            QueryPerformanceCounter(&begin);
-            for (unsigned i = 0; i < 1000000; ++i)
-                record_request_site(0x1000 + (i & 31u) * 37, 64, false);
-            QueryPerformanceCounter(&end);
-            const double microseconds = static_cast<double>(end.QuadPart - begin.QuadPart) *
-                1000000.0 / static_cast<double>(frequency.QuadPart);
-            std::printf("Request-site bookkeeping only: mode=%s calls=1000000 wall_us=%.0f (not an FPS benchmark)\n",
-                light ? "light" : "full", microseconds);
-        }
-    }
     return 0;
 }
