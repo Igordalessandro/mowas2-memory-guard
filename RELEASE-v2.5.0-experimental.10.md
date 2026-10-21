@@ -67,6 +67,10 @@ with warnings treated as errors, and the four changed DLL translation units
 compiled with `-Wall -Wextra -Wconversion -Werror`. The complete release DLL
 built as PE32/i386 and exports `ImageNtHeader` and `MiniDumpWriteDump`.
 
+The [GitHub regression run](https://github.com/Igordalessandro/mowas2-memory-guard/actions/runs/39527019786)
+passed all five portable suites under Linux sanitizers and executed all 13
+regression executables successfully on native Windows x86.
+
 The new tests cover alignment-aware fit counts, scan completion, preflight
 release attribution including a rearmed primary, failure-snapshot ordering,
 pinned compact memory evidence, large-history wrap/flood/concurrency, and

@@ -133,3 +133,9 @@ Run `bash tests/run-native.sh` and, for sanitizers,
 `MOWAS2_TEST_SANITIZERS=1 bash tests/run-native.sh`. Windows uses
 `tests/run-windows.ps1` with the pinned llvm-mingw toolchain. Real RobZ and
 Steam/Proton sessions remain a field-validation requirement.
+
+Publication validation: [GitHub run 39527019786](https://github.com/Igordalessandro/mowas2-memory-guard/actions/runs/39527019786)
+passed all five portable suites under Linux sanitizers and all 13 Windows x86
+regression executables. The published artifact is built with the pinned
+`20261006` UCRT llvm-mingw compiler. Verify it using
+`SHA256SUMS-v2.5.0-experimental.10.txt` from the release.
