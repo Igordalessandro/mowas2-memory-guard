@@ -4,7 +4,7 @@
 > This working branch identifies its DLL as `2.5.0-experimental.14`; it is not
 > the public stable release. Use the v2.4.2 GitHub release for stable rollback.
 
-Prerelease candidate: [experimental.14](docs/EXPERIMENTAL-14.md) adds sampled
+Experimental prerelease: [experimental.14](docs/EXPERIMENTAL-14.md) adds sampled
 retention ages, bounded caller traces/code windows and exact context for small
 allocation failures. Full per-request profiling and .13's other additions
 are retained; the light-mode option remains removed. See the

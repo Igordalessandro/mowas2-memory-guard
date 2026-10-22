@@ -163,3 +163,16 @@ Artifact: `dist/v2.5.0-experimental.14/dbghelp.dll`, PE32/x86, exporting only
 
 Publishing a prerelease does not install it on either PC; game deployment
 requires a separate request. Stable GitHub Latest remains v2.4.2.
+
+### Verified publication
+
+Published on 2026-10-22 as the non-draft
+[v2.5.0-experimental.14 prerelease](https://github.com/Igordalessandro/mowas2-memory-guard/releases/tag/v2.5.0-experimental.14),
+tagged at source commit `c3a8c672a02a12c1a77e28033f65493b663dfa85`.
+[GitHub regression run 39809188548](https://github.com/Igordalessandro/mowas2-memory-guard/actions/runs/39809188548)
+passed all eight Linux sanitizer suites and all seventeen regression
+executables on native Windows x86. Both uploaded assets were downloaded and
+byte-compared with the local DLL/checksum before publication. The public DLL
+digest matches the hash above, the tag resolves to the tested source commit,
+and stable Latest remains v2.4.2. Neither installed game was updated as part of
+this release. This publication record is a documentation-only follow-up.
