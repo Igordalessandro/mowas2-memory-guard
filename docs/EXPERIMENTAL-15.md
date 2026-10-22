@@ -119,3 +119,21 @@ community report is committed. Stable public Latest remains v2.4.2.
 
 Native Windows CI is still the publication gate at this local checkpoint.
 Neither PC has been updated or launched for this work.
+
+### Verified publication
+
+Published on 2026-10-22 as the non-draft
+[experimental.15 prerelease](https://github.com/Igordalessandro/mowas2-memory-guard/releases/tag/v2.5.0-experimental.15).
+The tag resolves to tested release source
+`dd18ba9528efb1fbf6fc5f70afee42127b5a8568`.
+[Regression run 39847951542](https://github.com/Igordalessandro/mowas2-memory-guard/actions/runs/39847951542)
+passed all nine portable sanitizer suites, ten analyzer tests and eighteen
+native Windows x86 regression executables. Both draft assets were downloaded
+and byte-compared against the local DLL/manifest before publication. GitHub's
+published DLL digest matches the SHA-256 above. Stable Latest was verified as
+v2.4.2; no local or Tety game deployment occurred.
+
+The PE mapped-image size increased by 128 KiB versus the .14 artifact
+(`0xDF000` to `0xFF000`), consistent with the bounded metadata addition.
+The inherited optional Proton text pool is separate and unchanged. This is
+not an assertion of zero runtime overhead or native gameplay validation.

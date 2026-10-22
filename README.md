@@ -4,7 +4,7 @@
 > This working branch identifies its DLL as `2.5.0-experimental.15`; it is not
 > the public stable release. Use the v2.4.2 GitHub release for stable rollback.
 
-Diagnostic candidate: [experimental.15](docs/EXPERIMENTAL-15.md) adds matched
+Experimental prerelease: [experimental.15](docs/EXPERIMENTAL-15.md) adds matched
 Steam/full reports, an offline analyzer, allocation-size/thread observations
 and an [evidence-first roadmap](docs/EVIDENCE-FIRST-ROADMAP.md) for evaluating
 targeted allocator and resource-lifetime fixes. It retains .14's ages/traces,

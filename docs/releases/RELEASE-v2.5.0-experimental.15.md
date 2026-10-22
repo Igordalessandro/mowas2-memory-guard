@@ -76,3 +76,9 @@ Publication requires the native Windows x86 and Linux sanitizer checks on the
 release source commit. Local Wine and synthetic tests are not native gameplay
 validation. See the [CI checks](https://github.com/Igordalessandro/mowas2-memory-guard/actions/workflows/regression-tests.yml)
 and [implementation guide](https://github.com/Igordalessandro/mowas2-memory-guard/blob/v2.5.0-experimental.15/docs/EXPERIMENTAL-15.md).
+
+Verified release source: `dd18ba9528efb1fbf6fc5f70afee42127b5a8568`.
+[Run 39847951542](https://github.com/Igordalessandro/mowas2-memory-guard/actions/runs/39847951542)
+passed nine portable sanitizer suites, ten analyzer tests and eighteen native
+Windows x86 regression executables. Both uploaded assets were downloaded and
+byte-compared before publication. Neither installed game was updated.
