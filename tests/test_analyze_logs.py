@@ -23,6 +23,7 @@ LEGACY = """[2026-10-21 12:00:00.000] mowas2-memory-guard v2.5.0-experimental.13
 [2026-10-21 12:01:02.000] SYSTEM MEMORY : available_phys=14079MiB total_phys=32060MiB page_faults=123 (soft+hard)
 """
 MODERN = """[2026-10-22 12:00:00.000] REPORT SESSION : fmt=2 sid=example-p42 full_log=mowas2-memory-guard-example.log exp=off request_status=off
+[2026-10-22 12:00:00.000] Build: Oct 22 2026 12:00:00
 [2026-10-22 12:00:00.000] session v=2.5.0-experimental.15 sid=example-p42 env=native-windows exp=off fmt=2
 [2026-10-22 12:00:01.000] ALLOC PROFILER hook : HeapAlloc IAT=00100000 original=00200000
 [2026-10-22 12:00:30.000] ALLOC WATCH AGE : snap=1 site=+003749C9 sample_blocks=2 sample_B=2048 delta_B=0 oldest_ms=60000
@@ -56,6 +57,7 @@ class AnalyzerTests(unittest.TestCase):
         result = self.parse(MODERN)
         self.assertEqual(result["session"]["sid"], "example-p42")
         self.assertEqual(result["session"]["experiment"], "off")
+        self.assertEqual(result["session"]["build"], "Oct 22 2026 12:00:00")
         self.assertEqual(result["retained_by_caller"]["+003749C9"]["delta_from_first_sample_B"], -1024)
         self.assertEqual(result["hook_apis_observed"], ["HeapAlloc"])
         self.assertEqual(result["request_shape"]["1"]["request_samples"], "300")
@@ -93,6 +95,8 @@ class AnalyzerTests(unittest.TestCase):
         self.assertEqual(analyzer.compare([result, self.parse(LEGACY)])["status"], "incompatible_or_unknown_metadata")
         wrong = self.parse(MODERN.replace("full_log=mowas2-memory-guard-example.log", "full_log=wrong.log"))
         self.assertEqual(analyzer.compare([result, wrong])["status"], "session_correlation_conflict")
+        wrong_version = self.parse(MODERN.replace("experimental.15", "experimental.14"))
+        self.assertEqual(analyzer.compare([result, wrong_version])["status"], "session_correlation_conflict")
 
     def test_bounded_history(self):
         result = self.parse("[2026-10-22 12:00:00.000] MEM FAILURE SNAPSHOT : bytes=1\n" * 1000)

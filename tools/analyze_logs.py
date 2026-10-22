@@ -49,7 +49,7 @@ def analyze_lines(lines, name="selected.log"):
     scan_cost = {}
     warnings = set()
     session = {"version": None, "sid": None, "environment": None, "experiment": None,
-               "format": None, "full_log": None}
+               "format": None, "full_log": None, "build": None}
     profile, lifecycle, system, cpu = {}, {}, {}, {}
     previous_profile = None
     max_allocation_rate = None
@@ -82,6 +82,8 @@ def analyze_lines(lines, name="selected.log"):
             if session["version"] and session["version"] != version[1]:
                 warnings.add("multiple_sessions_or_versions_in_input")
             session["version"] = version[1]
+        if message.startswith("Build:"):
+            session["build"] = message.partition(":")[2].strip() or None
         if message.startswith("session "):
             for source, target in (("v", "version"), ("sid", "sid"), ("env", "environment"),
                                    ("exp", "experiment"), ("fmt", "format")):
@@ -315,13 +317,17 @@ def compare(reports):
     sessions = [report["session"] for report in reports]
     ids, logs = [item["sid"] for item in sessions], [item["full_log"] for item in sessions]
     if all(ids) and all(logs):
+        versions = {item["version"] for item in sessions if item["version"] is not None}
         if (len(set(ids)) == 1) != (len(set(logs)) == 1):
             return {"status": "session_correlation_conflict", "controlled_comparison": False,
                     "warning": "Session identifiers and referenced full-log filenames disagree; do not combine these records."}
         if len(set(ids)) == 1:
+            if len(versions) > 1:
+                return {"status": "session_correlation_conflict", "controlled_comparison": False,
+                        "warning": "The same session claims different DLL versions; do not combine these records."}
             return {"status": "matching_session", "controlled_comparison": False,
                     "warning": "These files identify the same session, not independent comparison runs; content equality is not certified."}
-    metadata = [(r["session"]["version"], r["session"]["environment"], r["session"]["experiment"])
+    metadata = [(r["session"]["version"], r["session"]["build"], r["session"]["environment"], r["session"]["experiment"])
                 for r in reports]
     known = all(all(value is not None for value in key) for key in metadata)
     status = "matching_build_environment_only" if known and len(set(metadata)) == 1 else "incompatible_or_unknown_metadata"
