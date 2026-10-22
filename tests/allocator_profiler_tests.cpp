@@ -10,14 +10,18 @@
 namespace {
 DWORD last_error = 0;
 DWORD incoming_error = 0xBEEF;
+DWORD diagnostic_tick = 100000;
 DWORD WINAPI mock_get_last_error() { return last_error; }
 void WINAPI mock_set_last_error(DWORD value) { last_error = value; }
+DWORD WINAPI mock_tick() { return diagnostic_tick; }
 }
 #define GetLastError mock_get_last_error
 #define SetLastError mock_set_last_error
+#define GetTickCount mock_tick
 #include "../src/diagnostics/allocator_profiler.cpp"
 #undef GetLastError
 #undef SetLastError
+#undef GetTickCount
 
 namespace {
 unsigned release_calls = 0;
@@ -40,6 +44,8 @@ DWORD snapshot_errors[2] = {};
 bool insert_during_logging = false;
 bool saw_full_profile = false;
 bool saw_full_request_site = false;
+unsigned trace_lines = 0;
+unsigned age_lines = 0;
 }
 
 namespace memory_guard {
@@ -69,6 +75,8 @@ void log(const char* format, ...) {
     assert(!std::strstr(format, "ALLOC TOP REQUEST EST"));
     if (std::strstr(format, "mode=full request_site_rate=1/1")) saw_full_profile = true;
     if (std::strstr(format, "ALLOC TOP REQUEST #")) saw_full_request_site = true;
+    if (std::strstr(format, "ALLOC WATCH TRACE :")) ++trace_lines;
+    if (std::strstr(format, "ALLOC WATCH AGE :")) ++age_lines;
     if (insert_during_logging) {
         // A producer must remain free to acquire the history lock while a
         // copied snapshot is logged; logging while holding it deadlocks.
@@ -132,6 +140,11 @@ void reset() {
     g_callsites_saturated.store(false);
     g_sample_entries = g_sample_drops = 0;
     g_callsite_cache.clear();
+    g_age_sequence = 0;
+    diagnostic_tick = 100000;
+    g_failure_trace_count.store(0);
+    for (auto& trace : g_watch_traces) { trace.state.store(0); trace.event = {}; }
+    for (auto& logged : g_watch_code_logged) logged.store(false);
     g_sample_live_bytes = 0;
     g_engine_context_active = true;
     g_engine_context_rva = 10;
@@ -197,6 +210,68 @@ int main() {
     }
     assert(load64(&g_callsite_drops) - drops_before == 2);
 
+    // Pre-registering watch sites keeps them within the saturated probe bound
+    // without expanding the table or changing full request accounting.
+    reset();
+    CallsiteStat* watched[diagnostics::WATCH_SITE_COUNT]{};
+    for (unsigned i = 0; i < diagnostics::WATCH_SITE_COUNT; ++i)
+        watched[i] = callsite_for(diagnostics::WATCH_SITES[i]);
+    for (unsigned i = 0; i < CALLSITE_CAPACITY; ++i) callsite_for(0x100000u + i);
+    assert(g_callsites_saturated.load());
+    for (unsigned i = 0; i < diagnostics::WATCH_SITE_COUNT; ++i)
+        assert(watched[i] && callsite_for(diagnostics::WATCH_SITES[i]) == watched[i]);
+
+    // Age metadata is taken from live sample identities, never payloads or
+    // freed-block averages. It survives site-registration saturation.
+    reset();
+    g_engine_context_rva = diagnostics::WATCH_SITES[0];
+    g_callsites_saturated.store(true);
+    assert(insert_sample(sampled_pointer, 100, diagnostics::WATCH_SITES[0], nullptr));
+    auto ages = snapshot_retained_ages();
+    assert(ages.baseline && ages.total.bytes == 100 && ages.sites[0].blocks == 1);
+    assert(ages.total.oldest_ms == 0 && ages.deltas[0] == 0);
+    diagnostic_tick += 60000;
+    ages = snapshot_retained_ages();
+    assert(!ages.baseline && ages.span == 60000 && ages.sequence == 2);
+    assert(ages.sites[0].oldest_ms == 60000 && ages.sites[0].age_bytes[3] == 100);
+    retire_sample(detach_sample(sampled_pointer));
+    ages = snapshot_retained_ages();
+    assert(ages.total.bytes == 0 && ages.deltas[0] == -100);
+    const unsigned ages_before = age_lines;
+    log_watch_diagnostics();
+    assert(age_lines == ages_before + diagnostics::WATCH_SITE_COUNT);
+
+    // Only one successful >=64 KiB trace per watched caller and eight failure
+    // traces per process. Publication preserves LastError and logging drains
+    // records once, with no lock held across logger calls.
+    reset();
+    g_engine_context_rva = diagnostics::WATCH_SITES[0];
+    g_engine_context_size = 699192;
+    last_error = incoming_error;
+    record_diagnostic_trace(LargeAllocationKind::heap, 64, 0x93176c, false, 0);
+    assert(g_watch_traces[0].state.load() == 0);
+    record_diagnostic_trace(LargeAllocationKind::heap, 699211, 0x93176c, false, 0);
+    assert(last_error == incoming_error && g_watch_traces[0].state.load() == 2);
+    assert(g_watch_traces[0].event.engine_bytes == 699192);
+    assert(g_watch_traces[0].event.native_bytes == 699211);
+    record_diagnostic_trace(LargeAllocationKind::heap, 999999, 0x93176c, false, 0);
+    assert(g_watch_traces[0].event.native_bytes == 699211);
+    for (unsigned i = 0; i < 20; ++i)
+        record_diagnostic_trace(LargeAllocationKind::heap, 699211, 0x93176c, true, 0);
+    assert(g_failure_trace_count.load() == diagnostics::FAILURE_TRACES);
+    const unsigned traces_before = trace_lines;
+    log_watch_traces();
+    assert(trace_lines == traces_before + 1 + diagnostics::FAILURE_TRACES);
+    log_watch_traces();
+    assert(trace_lines == traces_before + 1 + diagnostics::FAILURE_TRACES);
+
+    reset();
+    g_engine_context_active = false;
+    record_diagnostic_trace(LargeAllocationKind::heap, 699211, diagnostics::WATCH_SITES[0], false, 0);
+    assert(g_watch_traces[0].state.load() == 2);
+    assert(g_watch_traces[0].event.engine_rva == 0xffffffffu);
+    assert(g_watch_traces[0].event.engine_bytes == 0);
+
     // Every request contributes its exact count and size to a tracked site;
     // request-site sampling/weighting must not silently return.
     reset();
@@ -230,6 +305,20 @@ int main() {
     assert(native_calls == 2 && native_size == 123 && native_flags == HEAP_ZERO_MEMORY);
     assert(release_calls == 1 && snapshot_calls == 2);
     assert(last_error == ERROR_ALREADY_EXISTS);
+
+    // Recovered small native failures retain the real engine context, not a
+    // size inferred later from wrapper overhead or a periodic summary.
+    reset();
+    g_engine_context_rva = diagnostics::WATCH_SITES[1];
+    g_engine_context_size = 699192;
+    stages_available = 1;
+    succeed_on_call = 2;
+    assert(profiled_heap_alloc(nullptr, 0, 699211) == replacement_pointer);
+    LargeAllocationEvent small_failure[1]{};
+    assert(g_large_history.snapshot(small_failure, 1) == 1);
+    assert(small_failure[0].requested == 699211 && small_failure[0].engine_requested == 699192);
+    assert(small_failure[0].engine_rva == diagnostics::WATCH_SITES[1]);
+    assert(small_failure[0].initial_failure && small_failure[0].flags == (FLIGHT_FAILURE | FLIGHT_RECOVERED));
 
     reset();
     assert(insert_sample(sampled_pointer, 100, 10, nullptr));

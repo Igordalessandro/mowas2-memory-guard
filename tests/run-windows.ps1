@@ -26,7 +26,8 @@ $sources = @(
     'engine_alloc_tests',
     'stable_steam_text_test',
     'steam_text_guard_tests',
-    'profiling_policy_test'
+    'profiling_policy_test',
+    'watch_diagnostics_test'
 )
 foreach ($name in $sources) {
     $source = Join-Path $PSScriptRoot "$name.cpp"

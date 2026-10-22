@@ -25,4 +25,6 @@ fi
 "$test_build_dir/steam-text-test"
 "$test_cxx" "${flags[@]}" "$project_root/tests/profiling_policy_test.cpp" -o "$test_build_dir/profiling-policy-test"
 "$test_build_dir/profiling-policy-test"
+"$test_cxx" "${flags[@]}" "$project_root/tests/watch_diagnostics_test.cpp" -o "$test_build_dir/watch-diagnostics-test"
+"$test_build_dir/watch-diagnostics-test"
 echo "All native regression tests passed."

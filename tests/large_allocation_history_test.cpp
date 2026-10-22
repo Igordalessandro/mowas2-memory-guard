@@ -48,6 +48,18 @@ int main() {
     assert(history.snapshot(snapshot, 16) == 16);
     assert(snapshot[0].tick == 55 && snapshot[15].tick == 70);
 
+    // Small ordinary traffic stays excluded, but a real failure must retain
+    // its exact native/engine sizes even below the large-request threshold.
+    History failures;
+    Event small_failure = make_event(7, 699211);
+    small_failure.engine_requested = 699192;
+    small_failure.initial_failure = true;
+    failures.record(small_failure);
+    for (unsigned i = 0; i < 100000; ++i) failures.record(make_event(i, 48));
+    assert(failures.snapshot(snapshot, 32) == 1);
+    assert(snapshot[0].requested == 699211 && snapshot[0].engine_requested == 699192);
+    assert(snapshot[0].initial_failure);
+
     History concurrent;
     std::atomic<unsigned> complete {0};
     std::thread writers[4];

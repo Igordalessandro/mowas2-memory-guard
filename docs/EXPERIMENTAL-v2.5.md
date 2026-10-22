@@ -1,6 +1,8 @@
 # v2.5 allocator-diagnostics experiment
 
-The current prerelease is `2.5.0-experimental.13`, with full request-site
+The current experiment is `2.5.0-experimental.14`, adding sampled retention
+ages, bounded caller traces/code windows and small-failure context. See the
+[experimental.14 guide](EXPERIMENTAL-14.md). It retains full request-site
 profiling, bounded caller caching, VA-scan timing, physical-memory context
 and the optional Proton Steam-text workaround. See the
 [experimental.13 guide](EXPERIMENTAL-13.md) for its exact scope and limitations.

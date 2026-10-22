@@ -4,6 +4,7 @@
 #include "diagnostics/retry_policy.h"
 #include "diagnostics/large_allocation_history.h"
 #include "diagnostics/profiling_policy.h"
+#include "diagnostics/watch_diagnostics.h"
 #include "orchestration/memory_guard.h"
 #include "shared/core/module.h"
 #include "shared/logging/logger.h"
@@ -14,6 +15,7 @@
 #include <cstdint>
 #include <cstring>
 #include <atomic>
+#include <cstdio>
 
 namespace allocator_profiler {
 namespace {
@@ -143,6 +145,82 @@ alignas(8) static volatile LONG64 g_heap_requested_bytes = 0;
 alignas(8) static volatile LONG64 g_virtual_requested_bytes = 0;
 alignas(8) static volatile LONG64 g_sample_live_bytes = 0;
 
+struct DiagnosticErrorScope {
+    DWORD error = GetLastError();
+    ~DiagnosticErrorScope() { SetLastError(error); }
+};
+
+struct TraceRecord {
+    DWORD tick, thread, direct_rva, engine_rva, native_bytes, engine_bytes, request_flags;
+    DWORD capture_wall_ms = 0;
+    DWORD frames[diagnostics::TRACE_FRAMES]{};
+    unsigned frame_count = 0;
+    LargeAllocationKind kind = LargeAllocationKind::heap;
+    bool failure = false;
+};
+struct TraceSlot {
+    // One publication per slot: empty -> writing -> ready -> logged.
+    std::atomic<unsigned> state{0};
+    TraceRecord event{};
+};
+static TraceSlot g_watch_traces[diagnostics::TRACE_CAPACITY];
+static std::atomic<unsigned> g_failure_trace_count{0};
+static std::atomic<bool> g_watch_code_logged[diagnostics::WATCH_SITE_COUNT]{};
+static_assert(std::atomic<unsigned>::is_always_lock_free, "trace publication must be lock-free");
+// Retention baseline is protected by g_sample_lock, just like sample entries.
+static unsigned long long g_age_sequence = 0;
+static DWORD g_age_previous_tick = 0;
+static unsigned long long g_age_previous_bytes[diagnostics::WATCH_SITE_COUNT + 1]{};
+static_assert(sizeof(g_watch_traces) + sizeof(g_failure_trace_count) +
+              sizeof(g_watch_code_logged) + sizeof(g_age_previous_bytes) +
+              sizeof(g_age_sequence) + sizeof(g_age_previous_tick) < 4096,
+              "new diagnostics must use less than 4 KiB of static state");
+
+static void record_diagnostic_trace(LargeAllocationKind kind, SIZE_T native_bytes,
+                                    DWORD direct, bool failed, DWORD request_flags) {
+    unsigned slot_index;
+    const DWORD engine = g_engine_context_active ? g_engine_context_rva : 0xFFFFFFFFu;
+    const DWORD observed_site = g_engine_context_active ? engine : direct;
+    if (failed) {
+        unsigned index = g_failure_trace_count.load(std::memory_order_relaxed);
+        do {
+            if (index >= diagnostics::FAILURE_TRACES) return;
+        } while (!g_failure_trace_count.compare_exchange_weak(
+            index, index + 1, std::memory_order_relaxed));
+        slot_index = diagnostics::WATCH_SITE_COUNT + index;
+    } else {
+        if (native_bytes < diagnostics::WATCH_TRACE_MIN_BYTES) return;
+        slot_index = diagnostics::watch_index(observed_site);
+        if (slot_index == diagnostics::WATCH_SITE_COUNT) return;
+    }
+    TraceSlot& slot = g_watch_traces[slot_index];
+    if (slot.state.load(std::memory_order_relaxed) != 0) return;
+    unsigned empty = 0;
+    if (!slot.state.compare_exchange_strong(empty, 1, std::memory_order_acquire)) return;
+    DiagnosticErrorScope preserve_error;
+    TraceRecord event{};
+    event.tick = GetTickCount();
+    event.thread = GetCurrentThreadId();
+    event.direct_rva = direct;
+    event.engine_rva = engine;
+    event.native_bytes = static_cast<DWORD>(native_bytes);
+    event.engine_bytes = g_engine_context_active ? static_cast<DWORD>(g_engine_context_size) : 0;
+    event.request_flags = request_flags;
+    event.kind = kind;
+    event.failure = failed;
+    void* frames[24]{};
+    const USHORT count = RtlCaptureStackBackTrace(0, 24, frames, nullptr);
+    for (USHORT i = 0; i < count && event.frame_count < diagnostics::TRACE_FRAMES; ++i) {
+        std::uint32_t rva = 0;
+        if (diagnostics::image_rva(g_base, TARGET_IMAGE_SIZE,
+                reinterpret_cast<std::uintptr_t>(frames[i]), rva))
+            event.frames[event.frame_count++] = rva;
+    }
+    event.capture_wall_ms = GetTickCount() - event.tick;
+    slot.event = event;
+    slot.state.store(2, std::memory_order_release);
+}
+
 static __forceinline DWORD caller_rva() {
     const std::uintptr_t caller = reinterpret_cast<std::uintptr_t>(_ReturnAddress());
     if (caller >= g_base && caller < g_base + TARGET_IMAGE_SIZE) {
@@ -192,6 +270,123 @@ static void unlock_samples() {
     InterlockedExchange(&g_sample_lock, 0);
 }
 
+struct AgeSnapshot {
+    diagnostics::AgeTotals total;
+    diagnostics::AgeTotals sites[diagnostics::WATCH_SITE_COUNT];
+    long long deltas[diagnostics::WATCH_SITE_COUNT + 1]{};
+    unsigned long long sequence = 0;
+    DWORD tick = 0, span = 0, wall_ms = 0;
+    bool baseline = false;
+};
+
+static AgeSnapshot snapshot_retained_ages() {
+    AgeSnapshot snapshot{};
+    const DWORD started = GetTickCount();
+    // Metadata only: no dereferencing sampled allocations, OS memory reads,
+    // logging, heap allocation or stack unwinding while holding this lock.
+    lock_samples();
+    snapshot.tick = GetTickCount();
+    snapshot.baseline = g_age_sequence == 0;
+    snapshot.sequence = ++g_age_sequence;
+    snapshot.span = snapshot.baseline ? 0 : snapshot.tick - g_age_previous_tick;
+    for (const SampleEntry& entry : g_samples) {
+        if (!entry.pointer) continue;
+        snapshot.total.add(entry.size, entry.tick, snapshot.tick);
+        const unsigned index = diagnostics::watch_index(entry.alloc_rva);
+        if (index != diagnostics::WATCH_SITE_COUNT)
+            snapshot.sites[index].add(entry.size, entry.tick, snapshot.tick);
+    }
+    for (unsigned i = 0; i <= diagnostics::WATCH_SITE_COUNT; ++i) {
+        const unsigned long long bytes = i == diagnostics::WATCH_SITE_COUNT
+            ? snapshot.total.bytes : snapshot.sites[i].bytes;
+        snapshot.deltas[i] = snapshot.baseline ? 0 :
+            static_cast<long long>(bytes) - static_cast<long long>(g_age_previous_bytes[i]);
+        g_age_previous_bytes[i] = bytes;
+    }
+    g_age_previous_tick = snapshot.tick;
+    unlock_samples();
+    snapshot.wall_ms = GetTickCount() - started;
+    return snapshot;
+}
+
+static void log_watch_code(DWORD rva) {
+    const unsigned index = diagnostics::watch_index(rva);
+    if (!g_base || index == diagnostics::WATCH_SITE_COUNT ||
+        g_watch_code_logged[index].exchange(true, std::memory_order_relaxed)) return;
+    DiagnosticErrorScope preserve_error;
+    unsigned char bytes[diagnostics::CODE_BYTES]{};
+    const bool copied = diagnostics::read_code_window(g_base, TARGET_IMAGE_SIZE, rva,
+        [](std::uintptr_t address, void* output, std::size_t length) {
+            SIZE_T copied_bytes = 0;
+            return ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(address),
+                output, length, &copied_bytes) && copied_bytes == length;
+        }, bytes);
+    if (!copied) {
+        logger::log("ALLOC WATCH CODE : site=+%08lX status=unreadable (game image only)",
+                    static_cast<unsigned long>(rva));
+        return;
+    }
+    static const char hex[] = "0123456789ABCDEF";
+    char encoded[diagnostics::CODE_BYTES * 2 + 1]{};
+    for (unsigned i = 0; i < diagnostics::CODE_BYTES; ++i) {
+        encoded[i * 2] = hex[bytes[i] >> 4];
+        encoded[i * 2 + 1] = hex[bytes[i] & 15u];
+    }
+    logger::log("ALLOC WATCH CODE : site=+%08lX start=+%08lX bytes=64 hex=%s (game image only; not allocation contents)",
+        static_cast<unsigned long>(rva),
+        static_cast<unsigned long>(rva - diagnostics::CODE_BEFORE), encoded);
+}
+
+static void log_watch_traces() {
+    for (unsigned i = 0; i < diagnostics::TRACE_CAPACITY; ++i) {
+        TraceSlot& slot = g_watch_traces[i];
+        unsigned ready = 2;
+        if (!slot.state.compare_exchange_strong(ready, 3, std::memory_order_acquire)) continue;
+        // Immutable after release-publication; no producer ever reuses a slot.
+        const TraceRecord event = slot.event;
+        char frames[diagnostics::TRACE_FRAMES * 10 + 1]{};
+        for (unsigned frame = 0; frame < event.frame_count; ++frame)
+            std::snprintf(frames + frame * 9, sizeof(frames) - frame * 9,
+                          "%08lX%s", static_cast<unsigned long>(event.frames[frame]),
+                          frame + 1 < event.frame_count ? "," : "");
+        const char* kind = event.kind == LargeAllocationKind::engine ? "engine" :
+                           event.kind == LargeAllocationKind::realloc ? "HeapReAlloc" :
+                           event.kind == LargeAllocationKind::virtual_alloc ? "VirtualAlloc" : "HeapAlloc";
+        logger::log("ALLOC WATCH TRACE : slot=%u failure=%u api=%s tick=%lu thread=%lu direct=+%08lX engine=+%08lX native_bytes=%lu engine_bytes=%lu request_flags=0x%08lX game_frames=%u capture_wall_ms=%lu rvas=%s",
+            i, event.failure ? 1u : 0u, kind,
+            static_cast<unsigned long>(event.tick), static_cast<unsigned long>(event.thread),
+            static_cast<unsigned long>(event.direct_rva), static_cast<unsigned long>(event.engine_rva),
+            static_cast<unsigned long>(event.native_bytes), static_cast<unsigned long>(event.engine_bytes),
+            static_cast<unsigned long>(event.request_flags), event.frame_count,
+            static_cast<unsigned long>(event.capture_wall_ms),
+            event.frame_count ? frames : "unavailable");
+        log_watch_code(event.engine_rva);
+        log_watch_code(event.direct_rva);
+    }
+}
+
+static void log_watch_diagnostics() {
+    const AgeSnapshot snapshot = snapshot_retained_ages();
+    logger::log("ALLOC RETAINED AGE : snap=%llu tick=%lu span_ms=%lu baseline=%u sample_blocks=%lu sample_B=%llu delta_B=%lld oldest_ms=%lu sample_rate=1/1024 metadata_wall_ms=%lu metadata_only=yes",
+        snapshot.sequence, static_cast<unsigned long>(snapshot.tick),
+        static_cast<unsigned long>(snapshot.span), snapshot.baseline ? 1u : 0u,
+        static_cast<unsigned long>(snapshot.total.blocks),
+        static_cast<unsigned long long>(snapshot.total.bytes),
+        snapshot.deltas[diagnostics::WATCH_SITE_COUNT],
+        static_cast<unsigned long>(snapshot.total.oldest_ms),
+        static_cast<unsigned long>(snapshot.wall_ms));
+    for (unsigned i = 0; i < diagnostics::WATCH_SITE_COUNT; ++i) {
+        const diagnostics::AgeTotals& age = snapshot.sites[i];
+        logger::log("ALLOC WATCH AGE : snap=%llu site=+%08lX sample_blocks=%lu sample_B=%llu delta_B=%lld oldest_ms=%lu age_B_lt1s/lt10s/lt60s/ge60s=%llu/%llu/%llu/%llu",
+            snapshot.sequence, static_cast<unsigned long>(diagnostics::WATCH_SITES[i]),
+            static_cast<unsigned long>(age.blocks), static_cast<unsigned long long>(age.bytes),
+            snapshot.deltas[i], static_cast<unsigned long>(age.oldest_ms),
+            static_cast<unsigned long long>(age.age_bytes[0]), static_cast<unsigned long long>(age.age_bytes[1]),
+            static_cast<unsigned long long>(age.age_bytes[2]), static_cast<unsigned long long>(age.age_bytes[3]));
+    }
+    log_watch_traces();
+}
+
 static LONG64 load64(volatile LONG64* value) {
     return InterlockedCompareExchange64(value, 0, 0);
 }
@@ -204,7 +399,7 @@ static DWORD to_game_rva(std::uintptr_t caller) {
 static void record_large_request(LargeAllocationKind kind, SIZE_T size,
                                  DWORD direct_rva, void* result, HANDLE heap,
                                  DWORD request_flags, DWORD flags = 0) {
-    if (size < LARGE_FLIGHT_BYTES) return;
+    if (size < LARGE_FLIGHT_BYTES && !(flags & FLIGHT_FAILURE)) return;
     LargeAllocationEvent event {};
     event.tick = GetTickCount();
     event.thread_id = GetCurrentThreadId();
@@ -217,6 +412,7 @@ static void record_large_request(LargeAllocationKind kind, SIZE_T size,
     event.request_flags = request_flags;
     event.flags = flags;
     event.kind = kind;
+    event.initial_failure = (flags & FLIGHT_FAILURE) != 0;
     g_large_history.record(event);
 }
 
@@ -480,6 +676,7 @@ static LPVOID WINAPI profiled_heap_alloc(HANDLE heap, DWORD flags, SIZE_T size) 
     LPVOID result = g_originalHeapAlloc(heap, flags, size);
     DWORD native_error = GetLastError();
     const bool initial_failure = !result;
+    record_diagnostic_trace(LargeAllocationKind::heap, size, direct_rva, initial_failure, flags);
     if (!result) {
         memory_guard::capture_failure_snapshot("HeapAlloc", size, direct_rva, "initial");
         SIZE_T released_bytes = 0;
@@ -538,6 +735,7 @@ static LPVOID WINAPI profiled_heap_realloc(HANDLE heap, DWORD flags,
     LPVOID result = g_originalHeapReAlloc(heap, flags, pointer, size);
     DWORD native_error = GetLastError();
     const bool initial_failure = !result;
+    record_diagnostic_trace(LargeAllocationKind::realloc, size, direct_rva, initial_failure, flags);
     if (!result) {
         memory_guard::capture_failure_snapshot("HeapReAlloc", size, direct_rva, "initial");
         SIZE_T released_bytes = 0;
@@ -618,6 +816,7 @@ static LPVOID WINAPI profiled_virtual_alloc(LPVOID address, SIZE_T size,
     // A reserve can help only some failures, but all resource-exhaustion
     // errors belong in the crash evidence, including commit-limit failures.
     if (!result && is_resource_exhaustion_error(native_error)) {
+        record_diagnostic_trace(LargeAllocationKind::virtual_alloc, size, rva, true, allocation_type);
         memory_guard::capture_failure_snapshot("VirtualAlloc", size, rva, "initial");
         const DWORD original_error = native_error;
         SIZE_T released_bytes = 0;
@@ -854,6 +1053,9 @@ void begin_engine_request(std::size_t size, std::uintptr_t caller) {
 void end_engine_request(void* result, bool initial_failure, bool recovered) {
     if (!g_engine_context_active) return;
 
+    if (initial_failure || !result)
+        record_diagnostic_trace(LargeAllocationKind::engine, 0, g_engine_context_rva, true, 0);
+
     DWORD flags = 0;
     if (g_engine_context_size >= LARGE_FLIGHT_BYTES) flags |= FLIGHT_LARGE;
     if (memory_guard::is_under_pressure() &&
@@ -910,7 +1112,7 @@ void log_large_allocation_history() {
     LargeAllocationEvent events[16] {};
     const std::size_t count = g_large_history.snapshot(events, 16);
     if (!count) return;
-    logger::log("ALLOC LARGE HISTORY : threshold=1048576 capacity=32 showing=%zu completion_order=yes",
+    logger::log("ALLOC LARGE HISTORY : threshold=1048576 includes_small_failures=yes capacity=32 showing=%zu completion_order=yes",
                 count);
     for (std::size_t i = 0; i < count; ++i) {
         const LargeAllocationEvent& event = events[i];
@@ -965,6 +1167,7 @@ void log_summary(bool detailed) {
         static_cast<long>(g_sample_drops),
         static_cast<long>(g_callsites_saturated.load(std::memory_order_relaxed)));
 
+    log_watch_diagnostics();
     if (!detailed) return;
     constexpr unsigned TOP_COUNT = 6;
     RankedSite top_requested[TOP_COUNT] = {};
@@ -1070,6 +1273,9 @@ void log_summary(bool detailed) {
 
 bool install(std::uintptr_t game_base) {
     g_base = game_base;
+    // Protect these observed sites from late registration saturation. They
+    // enter an otherwise empty table, so bounded lookup can still find them.
+    for (const std::uint32_t rva : diagnostics::WATCH_SITES) callsite_for(rva);
     IatPatch patches[] = {
         {"HeapAlloc", reinterpret_cast<void*>(&profiled_heap_alloc),
          reinterpret_cast<void**>(&g_originalHeapAlloc), nullptr, 0},
@@ -1114,6 +1320,7 @@ bool install(std::uintptr_t game_base) {
     else logger::log("ALLOC PROFILER : summary thread creation failed error=%lu", GetLastError());
 
     InterlockedExchange(&g_installed, 1);
+    logger::log("ALLOC WATCH installed: sites=5 trace_capacity=13 failure_traces=8 frames=12 code_windows=5x64B metadata_age_snapshots=yes; full request-site profiling unchanged");
     logger::log(
         "ALLOC PROFILER installed: mode=full request-site=1/1, 1/%u lifetime sampling, 1/%u engine sampling, original allocators and failure recovery retained",
         SAMPLE_RATE, ENGINE_SAMPLE_RATE);

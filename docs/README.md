@@ -1,6 +1,7 @@
 # Documentation
 
 - [Experimental v2.5 overview](EXPERIMENTAL-v2.5.md)
+- [Experimental.14: targeted retention and caller evidence](EXPERIMENTAL-14.md)
 - [Experimental.13: full profiling and expanded diagnostics](EXPERIMENTAL-13.md)
 - [Experimental.10 diagnostic fields](EXPERIMENTAL-10-Diagnostics.md)
 - [Lag, repeated loads and heavy-mod crash investigation](INVESTIGATION-2026-10-21-Lag-And-Mod-Crashes.md)

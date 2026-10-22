@@ -20,6 +20,7 @@ struct LargeAllocationEvent {
     std::uint32_t request_flags;
     std::uint32_t flags;
     LargeAllocationKind kind;
+    bool initial_failure;
 };
 
 // The lock adapter supplies allocation-free lock()/unlock(). Both producers
@@ -31,7 +32,7 @@ public:
     static constexpr std::size_t minimum_bytes = 1024u * 1024u;
 
     void record(LargeAllocationEvent event) {
-        if (event.requested < minimum_bytes) return;
+        if (event.requested < minimum_bytes && !event.initial_failure) return;
         lock_.lock();
         event.sequence = ++sequence_;
         entries_[next_] = event;
