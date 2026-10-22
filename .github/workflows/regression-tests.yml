@@ -1,9 +1,9 @@
 name: DLL regression tests
 on:
   push:
-    paths: ['src/**', 'tests/**', '.github/workflows/regression-tests.yml']
+    paths: ['src/**', 'tests/**', 'tools/analyze_logs.py', '.github/workflows/regression-tests.yml']
   pull_request:
-    paths: ['src/**', 'tests/**', '.github/workflows/regression-tests.yml']
+    paths: ['src/**', 'tests/**', 'tools/analyze_logs.py', '.github/workflows/regression-tests.yml']
   workflow_dispatch:
 permissions:
   contents: read

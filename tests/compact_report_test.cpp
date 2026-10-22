@@ -3,6 +3,7 @@
 #include <cassert>
 #include <cstdio>
 #include <cstring>
+#include <initializer_list>
 
 namespace {
 
@@ -108,11 +109,34 @@ void sanitize_and_small_capacity() {
     assert(compact_report::build(nullptr, 0, fields) == 0);
 }
 
+void correlation_and_triage_outrank_traffic() {
+    char traffic[700];
+    fill_field(traffic, sizeof(traffic), "alloc=");
+    compact_report::Fields fields = {
+        "session v=2.5.0-experimental.15 sid=20261022-120000-001-p42 env=native-windows exp=off fmt=2",
+        "crash=not_captured_or_session_still_running",
+        "failure=HeapAlloc bytes=699211 site=+0032762D released=0MiB retries=0 result=not_attempted",
+        "mem_fail phase=initial free=36196KiB largest=480KiB guard=0MiB complete=1",
+        "guard=8/8/48/32MiB", traffic,
+        "hot retained=+003749C9 est=1594MiB sampled_blocks=45 rate=1/1024", "event=unknown",
+        "full_log=mowas2-memory-guard-2026-10-22-120000-001-p42.log",
+        "coverage=iat_only sample_drops=0 site_drops=130825 assessment=insufficient_evidence"
+    };
+    char output[901];
+    const auto used = compact_report::build(output, sizeof(output), fields);
+    check_bytes(output, used, sizeof(output));
+    for (const char* required : {fields.session, fields.crash, fields.failure, fields.memory,
+                                 fields.hotspot, fields.coverage, fields.full_log})
+        assert(std::strstr(output, required));
+    assert(!std::strstr(output, traffic));
+}
+
 }  // namespace
 
 int main() {
     maximum_fields_preserve_essentials();
     realistic_large_counters();
     sanitize_and_small_capacity();
+    correlation_and_triage_outrank_traffic();
     std::puts("compact report tests passed");
 }

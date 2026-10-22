@@ -1,6 +1,7 @@
 #include "shared/logging/logger.h"
 #include "shared/logging/compact_report.h"
 #include "app/config.h"
+#include "diagnostics/allocator_assessment.h"
 
 #include <windows.h>
 #include <cstdio>
@@ -22,6 +23,11 @@ static volatile LONG g_initState = INIT_PENDING;
 static constexpr int INIT_BUSY_WAIT_MS = 1000;
 
 static char g_reportSession[160] = {};
+static char g_reportFullLog[128] = {};
+static char g_reportCoverage[128] = {"coverage=not_available allocator_assessment=insufficient_evidence"};
+static char g_sessionId[64] = {};
+static char g_environment[256] = {};
+static const char* g_experimentStatus = "off";
 static char g_reportConfig[128] = {};
 static char g_reportMemory[160] = {"mem=not_available"};
 static char g_reportFailureMemory[160] = {};
@@ -40,7 +46,8 @@ static void rewrite_compact_report_locked() {
     const compact_report::Fields fields = {
         g_reportSession, g_reportCrash, g_reportFailure,
         g_reportFailureMemory[0] ? g_reportFailureMemory : g_reportMemory,
-        g_reportConfig, g_reportAllocator, g_reportHotspot, g_reportEvent
+        g_reportConfig, g_reportAllocator, g_reportHotspot, g_reportEvent,
+        g_reportFullLog, g_reportCoverage
     };
     const size_t used = compact_report::build(output, sizeof(output), fields);
 
@@ -95,12 +102,18 @@ static void initialize_report_header() {
     memory.dwLength = sizeof(memory);
     const BOOL have_memory = GlobalMemoryStatusEx(&memory);
 
+    char experiment[64] = {};
+    const DWORD experiment_length = GetEnvironmentVariableA("MOWAS2_EXPERIMENT", experiment, sizeof(experiment));
+    g_experimentStatus = experiment_length >= sizeof(experiment)
+        ? "refused_unvalidated" : diagnostics::experiment_status(experiment);
     snprintf(g_reportSession, sizeof(g_reportSession),
-             "session v=%s build=%s_%s pid=%lu env=%s process=x86 native=%s wow64=%s ram=%lluMiB",
-             MEMORY_GUARD_VERSION, __DATE__, __TIME__,
-             static_cast<unsigned long>(GetCurrentProcessId()), environment,
-             architecture_name(native_info.wProcessorArchitecture), wow64 ? "yes" : "no",
-             have_memory ? static_cast<unsigned long long>(memory.ullTotalPhys) / (1024ull * 1024ull) : 0ull);
+             "session v=%s sid=%s env=%.24s exp=off fmt=2",
+             MEMORY_GUARD_VERSION, g_sessionId, environment);
+    snprintf(g_environment, sizeof(g_environment), "ENVIRONMENT : env=%s process=x86 native=%s wow64=%s ram_MiB=%llu memory_available=%s build=%s_%s",
+        environment, architecture_name(native_info.wProcessorArchitecture), wow64 ? "yes" : "no",
+        have_memory ? static_cast<unsigned long long>(memory.ullTotalPhys) / (1024ull * 1024ull) : 0ull,
+        have_memory ? "yes" : "no",
+        __DATE__, __TIME__);
     snprintf(g_reportConfig, sizeof(g_reportConfig),
              "guard=%u/%u/%u/%uMiB release=%u/%u,%u/%uMiB final=segmented report_max=%uB",
              PRIMARY_RESERVE_MB, CRITICAL_RESERVE_MB, FINAL_RESERVE_MB,
@@ -237,10 +250,15 @@ bool init() {
     }
 
     wchar_t logPath[MAX_PATH] = {0};
+    SYSTEMTIME session_time;
+    GetLocalTime(&session_time);
+    snprintf(g_sessionId, sizeof(g_sessionId), "%04u%02u%02u-%02u%02u%02u-%03u-p%lu",
+        session_time.wYear, session_time.wMonth, session_time.wDay,
+        session_time.wHour, session_time.wMinute, session_time.wSecond, session_time.wMilliseconds,
+        static_cast<unsigned long>(GetCurrentProcessId()));
 #if LOG_FILE_PER_RUN
     rotate_session_logs(dllDir);
-    SYSTEMTIME st;
-    GetLocalTime(&st);
+    const SYSTEMTIME& st = session_time;
     int dated = _snwprintf_s(logPath, MAX_PATH, _TRUNCATE,
                              L"%s\\%s-%04u-%02u-%02u-%02u%02u%02u-%03u-p%lu.log",
                              dllDir, LOG_FILE_STEM,
@@ -269,6 +287,8 @@ bool init() {
         InterlockedExchange(&g_initState, INIT_PENDING);
         return false;
     }
+    const wchar_t* basename = wcsrchr(logPath, L'\\');
+    snprintf(g_reportFullLog, sizeof(g_reportFullLog), "full_log=%ls", basename ? basename + 1 : logPath);
 
     DWORD report_create_error = ERROR_SUCCESS;
     g_reportFile = open_preserved_report(dllDir, CRASH_REPORT_FILE_NAME,
@@ -291,6 +311,11 @@ bool init() {
         MEMORY_GUARD_VERSION);
     log("Build: %s %s", __DATE__, __TIME__);
     log("Session: pid=%lu log=%ws", static_cast<unsigned long>(GetCurrentProcessId()), logPath);
+    log("REPORT SESSION : fmt=2 sid=%s %s exp=off request_status=%s", g_sessionId, g_reportFullLog, g_experimentStatus);
+    log("%s", g_reportSession);
+    log("%s", g_environment);
+    log("DIAGNOSTIC CONTRACT : mode=full request_site_rate=1/1 lifetime_rate=1/1024 shape_rate=1/1024 observed_iat_only=yes ownership_audited=no phase=unknown automatic_upload=no");
+    log("FEATURES : native_allocator=yes recovery=unchanged behavioral_experiment=off VAC=see_guard_install_records editor=proxy_only");
     log("Compact report: %ws (hard limit %u ASCII bytes)",
         CRASH_REPORT_FILE_NAME, CRASH_REPORT_MAX_BYTES);
     if (g_reportFile == INVALID_HANDLE_VALUE) {
@@ -370,6 +395,13 @@ void report_hotspot(const char* fmt, ...) {
     va_list args;
     va_start(args, fmt);
     update_report_field(g_reportHotspot, sizeof(g_reportHotspot), false, fmt, args);
+    va_end(args);
+}
+
+void report_coverage(const char* fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    update_report_field(g_reportCoverage, sizeof(g_reportCoverage), false, fmt, args);
     va_end(args);
 }
 

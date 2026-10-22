@@ -1,6 +1,11 @@
 # v2.5 allocator-diagnostics experiment
 
-The current experiment is `2.5.0-experimental.14`, adding sampled retention
+The current experiment is `2.5.0-experimental.15`, adding matched compact/full
+reports, bounded allocator-size/thread evidence and an explicit-file offline
+analyzer. See the [experimental.15 guide](EXPERIMENTAL-15.md),
+[roadmap](EVIDENCE-FIRST-ROADMAP.md) and [evidence register](EVIDENCE-REGISTER.md).
+No replacement allocator or automatic cleanup is enabled. It inherits
+experimental.14's sampled retention
 ages, bounded caller traces/code windows and small-failure context. See the
 [experimental.14 guide](EXPERIMENTAL-14.md). It retains full request-site
 profiling, bounded caller caching, VA-scan timing, physical-memory context

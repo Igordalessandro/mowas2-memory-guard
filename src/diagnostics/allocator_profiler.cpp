@@ -5,6 +5,7 @@
 #include "diagnostics/large_allocation_history.h"
 #include "diagnostics/profiling_policy.h"
 #include "diagnostics/watch_diagnostics.h"
+#include "diagnostics/allocator_assessment.h"
 #include "orchestration/memory_guard.h"
 #include "shared/core/module.h"
 #include "shared/logging/logger.h"
@@ -49,6 +50,9 @@ static std::uintptr_t g_base = 0;
 static volatile LONG g_installed = 0;
 static thread_local unsigned g_engine_sample_counter = 0;
 static thread_local unsigned g_pressure_flight_counter = 0;
+static thread_local unsigned g_shape_counter = 0;
+static thread_local DWORD g_shape_random = 0x9E3779B9u;
+static thread_local unsigned g_shape_offset = 0;
 static thread_local bool g_engine_context_active = false;
 static thread_local DWORD g_engine_context_rva = 0xFFFFFFFFu;
 static thread_local SIZE_T g_engine_context_size = 0;
@@ -80,7 +84,40 @@ struct SampleEntry {
     DWORD alloc_rva;
     DWORD tick;
     CallsiteStat* origin;
+    DWORD thread_id;
+    DWORD request_flags;
 };
+
+struct alignas(8) ShapeStat {
+    volatile LONG64 calls = 0;
+    volatile LONG64 bytes = 0;
+};
+static ShapeStat g_request_shape[diagnostics::SHAPE_BUCKETS];
+static ShapeStat g_retired_shape[diagnostics::SHAPE_BUCKETS];
+alignas(8) static volatile LONG64 g_sample_cross_thread = 0;
+alignas(8) static volatile LONG64 g_sample_same_thread = 0;
+alignas(8) static volatile LONG64 g_sample_reallocated = 0;
+alignas(8) static volatile LONG64 g_sample_retired_ms = 0;
+static volatile LONG g_sample_request_flags = 0;
+static_assert(SAMPLE_CAPACITY * 2u * sizeof(DWORD) + sizeof(g_request_shape) +
+              sizeof(g_retired_shape) + 4u * sizeof(LONG64) + sizeof(LONG) < 256u * 1024u,
+              "additional allocator evidence must stay below 256 KiB");
+
+static void record_request_shape(SIZE_T size) {
+    const unsigned position = g_shape_counter++ & (diagnostics::REQUEST_SHAPE_RATE - 1u);
+    if (position == 0) {
+        if (g_shape_counter == 1) g_shape_random ^= GetCurrentThreadId();
+        if (!g_shape_random) g_shape_random = 0x9E3779B9u;
+        g_shape_random ^= g_shape_random << 13;
+        g_shape_random ^= g_shape_random >> 17;
+        g_shape_random ^= g_shape_random << 5;
+        g_shape_offset = g_shape_random & (diagnostics::REQUEST_SHAPE_RATE - 1u);
+    }
+    if (position != g_shape_offset) return;
+    ShapeStat& shape = g_request_shape[diagnostics::shape_bucket(size)];
+    InterlockedIncrement64(&shape.calls);
+    InterlockedExchangeAdd64(&shape.bytes, static_cast<LONG64>(size));
+}
 
 struct alignas(8) HeapStat {
     void* volatile handle;
@@ -513,7 +550,7 @@ static void record_failure_site(DWORD rva) {
     if (site) InterlockedIncrement(&site->failures);
 }
 
-static bool insert_sample(void* pointer, SIZE_T size, DWORD alloc_rva, HANDLE heap) {
+static bool insert_sample(void* pointer, SIZE_T size, DWORD alloc_rva, HANDLE heap, DWORD request_flags = 0) {
     if (!should_sample(pointer)) return false;
     const DWORD origin_rva = g_engine_context_active
         ? alloc_rva : sampled_upstream_rva(alloc_rva);
@@ -532,6 +569,8 @@ static bool insert_sample(void* pointer, SIZE_T size, DWORD alloc_rva, HANDLE he
             slot.alloc_rva = origin_rva;
             slot.tick = GetTickCount();
             slot.origin = origin_site;
+            slot.thread_id = GetCurrentThreadId();
+            slot.request_flags = request_flags;
             slot.pointer = pointer;
             inserted = true;
             break;
@@ -586,11 +625,21 @@ static SampleEntry detach_sample(void* pointer) {
     return found;
 }
 
-static void retire_sample(const SampleEntry& found, bool freed = true) {
+static void retire_sample(const SampleEntry& found, bool freed = true, bool reallocated = false) {
     if (!found.pointer) return;
     InterlockedDecrement(&g_sample_entries);
     InterlockedExchangeAdd64(&g_sample_live_bytes, -static_cast<LONG64>(found.size));
     const DWORD lifetime_ms = GetTickCount() - found.tick;
+    if (freed) {
+        ShapeStat& shape = g_retired_shape[diagnostics::shape_bucket(found.size)];
+        InterlockedIncrement64(&shape.calls);
+        InterlockedExchangeAdd64(&shape.bytes, static_cast<LONG64>(found.size));
+        InterlockedExchangeAdd64(&g_sample_retired_ms, lifetime_ms);
+        InterlockedIncrement64(found.thread_id == GetCurrentThreadId()
+            ? &g_sample_same_thread : &g_sample_cross_thread);
+        if (reallocated) InterlockedIncrement64(&g_sample_reallocated);
+        InterlockedOr(&g_sample_request_flags, static_cast<LONG>(found.request_flags));
+    }
 
     // Retain the original site pointer so freeing a sampled block still
     // removes its live bytes after call-site registration has saturated.
@@ -670,6 +719,7 @@ static LPVOID WINAPI profiled_heap_alloc(HANDLE heap, DWORD flags, SIZE_T size) 
     if (g_engine_context_active) g_engine_context_heap = heap;
     InterlockedIncrement64(&g_heap_alloc_calls);
     InterlockedExchangeAdd64(&g_heap_requested_bytes, static_cast<LONG64>(size));
+    record_request_shape(size);
     record_alloc_site(rva, size, false);
 
     SetLastError(incoming_error);
@@ -713,7 +763,7 @@ static LPVOID WINAPI profiled_heap_alloc(HANDLE heap, DWORD flags, SIZE_T size) 
     if (!initial_failure) {
         record_large_request(LargeAllocationKind::heap, size, direct_rva, result, heap, flags);
     }
-    if (result) insert_sample(result, size, rva, heap);
+    if (result) insert_sample(result, size, rva, heap, flags);
     SetLastError(native_error);
     return result;
 }
@@ -726,6 +776,7 @@ static LPVOID WINAPI profiled_heap_realloc(HANDLE heap, DWORD flags,
     if (g_engine_context_active) g_engine_context_heap = heap;
     InterlockedIncrement64(&g_heap_realloc_calls);
     InterlockedExchangeAdd64(&g_heap_requested_bytes, static_cast<LONG64>(size));
+    record_request_shape(size);
     record_alloc_site(rva, size, true);
 
     // Remove the old identity before the heap can reuse its address. Keep the
@@ -773,8 +824,8 @@ static LPVOID WINAPI profiled_heap_realloc(HANDLE heap, DWORD flags,
         record_large_request(LargeAllocationKind::realloc, size, direct_rva, result, heap, flags);
     }
     if (result) {
-        retire_sample(previous_sample);
-        insert_sample(result, size, rva, heap);
+        retire_sample(previous_sample, true, true);
+        insert_sample(result, size, rva, heap, flags);
     } else {
         restore_sample(previous_sample);
     }
@@ -1167,6 +1218,26 @@ void log_summary(bool detailed) {
         static_cast<long>(g_sample_drops),
         static_cast<long>(g_callsites_saturated.load(std::memory_order_relaxed)));
 
+    logger::report_coverage("coverage=iat_only sample_drops=%ld site_drops=%lld assessment=insufficient_evidence",
+        static_cast<long>(g_sample_drops), static_cast<long long>(load64(&g_callsite_drops)));
+    logger::log("ALLOCATOR ASSESSMENT : status=insufficient_evidence ownership_audited=no live_total=unknown allocator_slack=unknown request_shape=attempts_block_offset_sample retired_shape=pointer_sample counters=cumulative native_allocator=unchanged");
+    logger::log("ALLOC LIFECYCLE : rate=1/1024 same_thread=%lld cross_thread=%lld reallocated=%lld retired_ms=%lld flags_or=%08lX coverage=observed_iat_only freed_before_return=yes",
+        static_cast<long long>(load64(&g_sample_same_thread)),
+        static_cast<long long>(load64(&g_sample_cross_thread)),
+        static_cast<long long>(load64(&g_sample_reallocated)),
+        static_cast<long long>(load64(&g_sample_retired_ms)),
+        static_cast<unsigned long>(g_sample_request_flags));
+    for (unsigned i = 0; i < diagnostics::SHAPE_BUCKETS; ++i) {
+        const unsigned long long minimum = i ? diagnostics::SHAPE_LIMITS[i - 1] : 0;
+        const unsigned long long maximum = i + 1 < diagnostics::SHAPE_BUCKETS
+            ? diagnostics::SHAPE_LIMITS[i] - 1 : 0xFFFFFFFFull;
+        logger::log("ALLOC SHAPE : bucket=%u min_B=%llu max_B=%llu rate=1/1024 request_samples=%lld request_sample_B=%lld retired_samples=%lld retired_sample_B=%lld",
+            i, minimum, maximum, static_cast<long long>(load64(&g_request_shape[i].calls)),
+            static_cast<long long>(load64(&g_request_shape[i].bytes)),
+            static_cast<long long>(load64(&g_retired_shape[i].calls)),
+            static_cast<long long>(load64(&g_retired_shape[i].bytes)));
+    }
+
     log_watch_diagnostics();
     if (!detailed) return;
     constexpr unsigned TOP_COUNT = 6;
@@ -1198,10 +1269,7 @@ void log_summary(bool detailed) {
 
     if (top_requested[0].requested > 0 || top_live[0].sample_live > 0) {
         logger::report_hotspot(
-            "hot req=+%08lX/%lluMiB/%lldcalls retained=+%08lX/%lluMiB/%ldblocks",
-            static_cast<unsigned long>(top_requested[0].rva),
-            static_cast<unsigned long long>(top_requested[0].requested) / MiB,
-            static_cast<long long>(top_requested[0].calls),
+            "hot retained=+%08lX est=%lluMiB sampled_blocks=%ld rate=1/1024",
             static_cast<unsigned long>(top_live[0].rva),
             static_cast<unsigned long long>(top_live[0].sample_live) * SAMPLE_RATE / MiB,
             static_cast<long>(top_live[0].sample_live_count));

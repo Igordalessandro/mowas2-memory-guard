@@ -46,6 +46,8 @@ bool saw_full_profile = false;
 bool saw_full_request_site = false;
 unsigned trace_lines = 0;
 unsigned age_lines = 0;
+bool measure_new_log_bytes = false;
+unsigned new_log_bytes = 0;
 }
 
 namespace memory_guard {
@@ -71,6 +73,16 @@ void capture_failure_snapshot(const char*, std::size_t, std::uintptr_t, const ch
 namespace core { void register_module(const ModuleSpec&) {} }
 namespace logger {
 void log(const char* format, ...) {
+    if (measure_new_log_bytes && (std::strstr(format, "ALLOC SHAPE :") ||
+        std::strstr(format, "ALLOC LIFECYCLE :") || std::strstr(format, "ALLOCATOR ASSESSMENT :"))) {
+        char rendered[2048]{};
+        va_list args;
+        va_start(args, format);
+        const int length = std::vsnprintf(rendered, sizeof(rendered), format, args);
+        va_end(args);
+        assert(length >= 0 && static_cast<unsigned>(length) < sizeof(rendered));
+        new_log_bytes += static_cast<unsigned>(length) + 32u; // timestamp + CRLF allowance
+    }
     assert(!std::strstr(format, "mode=light"));
     assert(!std::strstr(format, "ALLOC TOP REQUEST EST"));
     if (std::strstr(format, "mode=full request_site_rate=1/1")) saw_full_profile = true;
@@ -95,6 +107,7 @@ void report_failure(const char* format, ...) {
     last_error = 0xBAD;
 }
 void report_allocator(const char*, ...) { last_error = 0xBAD; }
+void report_coverage(const char*, ...) { last_error = 0xBAD; }
 void report_hotspot(const char* format, ...) {
     assert(!std::strstr(format, "req_est"));
     last_error = 0xBAD;
@@ -146,6 +159,11 @@ void reset() {
     for (auto& trace : g_watch_traces) { trace.state.store(0); trace.event = {}; }
     for (auto& logged : g_watch_code_logged) logged.store(false);
     g_sample_live_bytes = 0;
+    g_shape_counter = 0;
+    for (auto& shape : g_request_shape) { shape.calls = 0; shape.bytes = 0; }
+    for (auto& shape : g_retired_shape) { shape.calls = 0; shape.bytes = 0; }
+    g_sample_cross_thread = g_sample_same_thread = g_sample_reallocated = g_sample_retired_ms = 0;
+    g_sample_request_flags = 0;
     g_engine_context_active = true;
     g_engine_context_rva = 10;
     g_engine_context_size = 2u * 1024u * 1024u;
@@ -172,6 +190,55 @@ int main() {
         if (!sampled_pointer) sampled_pointer = pointer;
         else replacement_pointer = pointer;
     }
+
+    reset();
+    for (auto& shape : g_request_shape) { shape.calls = 0x7fffffffffffffffLL; shape.bytes = 0x7fffffffffffffffLL; }
+    for (auto& shape : g_retired_shape) { shape.calls = 0x7fffffffffffffffLL; shape.bytes = 0x7fffffffffffffffLL; }
+    measure_new_log_bytes = true;
+    log_summary(false);
+    measure_new_log_bytes = false;
+    assert(new_log_bytes <= 4096);
+    std::printf("new allocator evidence maximum-counter summary_bytes=%u\n", new_log_bytes);
+    reset();
+    // Component microbenchmark only: not FPS or a game-wide overhead claim.
+    LARGE_INTEGER frequency{}, start{}, finish{};
+    assert(QueryPerformanceFrequency(&frequency));
+    for (unsigned round = 0; round < 3; ++round) {
+        for (unsigned observed = 0; observed < 2; ++observed) {
+            assert(QueryPerformanceCounter(&start));
+            for (unsigned i = 0; i < 1000000; ++i) {
+                record_alloc_site(10, 32, false);
+                if (observed) record_request_shape(32);
+            }
+            assert(QueryPerformanceCounter(&finish));
+            std::printf("shape benchmark round=%u enabled=%u calls=1000000 wall_us=%lld\n", round, observed,
+                static_cast<long long>((finish.QuadPart - start.QuadPart) * 1000000 / frequency.QuadPart));
+        }
+    }
+    reset();
+    // Distribution sampling is additional evidence, never a replacement for
+    // full accounting. No allocation payload is touched by either observer.
+    for (unsigned i = 0; i < diagnostics::REQUEST_SHAPE_RATE * 2; ++i) record_request_shape(32);
+    const unsigned shape_index = diagnostics::shape_bucket(32);
+    assert(load64(&g_request_shape[shape_index].calls) == 2);
+    assert(load64(&g_request_shape[shape_index].bytes) == 64);
+    assert(insert_sample(sampled_pointer, 100, 10, nullptr, HEAP_ZERO_MEMORY));
+    SampleEntry life = detach_sample(sampled_pointer);
+    assert(life.thread_id == GetCurrentThreadId() && life.request_flags == HEAP_ZERO_MEMORY);
+    diagnostic_tick += 10;
+    retire_sample(life, true, true);
+    assert(load64(&g_sample_reallocated) == 1 && load64(&g_sample_same_thread) == 1);
+    assert(load64(&g_sample_retired_ms) == 10);
+    assert(insert_sample(sampled_pointer, 100, 10, nullptr));
+    life = detach_sample(sampled_pointer);
+    life.thread_id = GetCurrentThreadId() + 1;
+    restore_sample(life);
+    retire_sample(detach_sample(sampled_pointer));
+    assert(load64(&g_sample_cross_thread) == 1);
+    const auto retired_before = load64(&g_retired_shape[diagnostics::shape_bucket(100)].calls);
+    assert(insert_sample(sampled_pointer, 100, 10, nullptr));
+    retire_sample(detach_sample(sampled_pointer), false);
+    assert(load64(&g_retired_shape[diagnostics::shape_bucket(100)].calls) == retired_before);
 
     reset();
     assert(insert_sample(sampled_pointer, 100, 10, nullptr));

@@ -1,6 +1,9 @@
 # Documentation
 
 - [Experimental v2.5 overview](EXPERIMENTAL-v2.5.md)
+- [Evidence-first roadmap](EVIDENCE-FIRST-ROADMAP.md)
+- [Evidence register](EVIDENCE-REGISTER.md)
+- [Experimental.15: reporting and allocator viability data](EXPERIMENTAL-15.md)
 - [Experimental.14: targeted retention and caller evidence](EXPERIMENTAL-14.md)
 - [Experimental.13: full profiling and expanded diagnostics](EXPERIMENTAL-13.md)
 - [Experimental.10 diagnostic fields](EXPERIMENTAL-10-Diagnostics.md)

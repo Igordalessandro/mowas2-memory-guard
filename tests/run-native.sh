@@ -27,4 +27,7 @@ fi
 "$test_build_dir/profiling-policy-test"
 "$test_cxx" "${flags[@]}" "$project_root/tests/watch_diagnostics_test.cpp" -o "$test_build_dir/watch-diagnostics-test"
 "$test_build_dir/watch-diagnostics-test"
+"$test_cxx" "${flags[@]}" "$project_root/tests/allocator_assessment_test.cpp" -o "$test_build_dir/allocator-assessment-test"
+"$test_build_dir/allocator-assessment-test"
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s "$project_root/tests" -p 'test_analyze_logs.py'
 echo "All native regression tests passed."

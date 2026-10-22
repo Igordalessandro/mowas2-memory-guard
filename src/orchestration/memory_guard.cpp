@@ -270,6 +270,38 @@ static bool try_rearm_recovery(const AddressSpaceSnapshot& snapshot) {
     });
 }
 
+static void log_process_cpu() {
+    static std::atomic_flag busy = ATOMIC_FLAG_INIT;
+    static unsigned long long previous_cpu = 0;
+    static ULONGLONG previous_wall = 0;
+    static bool have_baseline = false;
+    if (busy.test_and_set(std::memory_order_acquire)) return;
+    FILETIME created{}, exited{}, kernel{}, user{};
+    if (GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernel, &user)) {
+        const auto wide = [](FILETIME time) {
+            return (static_cast<unsigned long long>(time.dwHighDateTime) << 32) | time.dwLowDateTime;
+        };
+        const auto cpu = wide(kernel) + wide(user);
+        const auto now = GetTickCount64();
+        if (have_baseline && now > previous_wall && cpu >= previous_cpu) {
+            const auto span = now - previous_wall;
+            const auto percentage_x100 = (cpu - previous_cpu) / span;
+            logger::log("PROCESS CPU : available=yes span_ms=%llu cpu_us=%llu core_pct=%llu.%02llu basis=one_core_100_percent includes_all_game_threads=yes",
+                static_cast<unsigned long long>(span), (cpu - previous_cpu) / 10ull,
+                percentage_x100 / 100ull, percentage_x100 % 100ull);
+        } else {
+            logger::log("PROCESS CPU : available=yes baseline=1 core_pct=unknown");
+        }
+        previous_cpu = cpu;
+        previous_wall = now;
+        have_baseline = true;
+    } else {
+        have_baseline = false;
+        logger::log("PROCESS CPU : available=no core_pct=unknown");
+    }
+    busy.clear(std::memory_order_release);
+}
+
 static void log_snapshot(const AddressSpaceSnapshot& snapshot, bool low) {
     PROCESS_MEMORY_COUNTERS_EX pmc = {};
     pmc.cb = sizeof(pmc);
@@ -293,7 +325,7 @@ static void log_snapshot(const AddressSpaceSnapshot& snapshot, bool low) {
 
     logger::log(
         "MEM%s : VA free=%llu MiB largest=%lu MiB @ %p committed=%llu MiB reserved=%llu MiB "
-        "guard=%lu MiB (primary=%lu critical=%lu final=%lu recovery=%lu) | requests=%lld cumulative=%llu MiB max_request=%ld KiB | private=%llu MiB working_set=%llu MiB",
+        "guard=%lu MiB (primary=%lu critical=%lu final=%lu recovery=%lu) | requests=%lld cumulative=%llu MiB max_request=%ld KiB | private=%llu MiB working_set=%llu MiB process_available=%s",
         low ? " WARNING" : "",
         snapshot.free_bytes / MiB,
         static_cast<unsigned long>(snapshot.largest_free / MiB),
@@ -309,15 +341,20 @@ static void log_snapshot(const AddressSpaceSnapshot& snapshot, bool low) {
         static_cast<unsigned long long>(requested) / MiB,
         largest / 1024,
         have_process ? static_cast<unsigned long long>(pmc.PrivateUsage) / MiB : 0ull,
-        have_process ? static_cast<unsigned long long>(pmc.WorkingSetSize) / MiB : 0ull);
+        have_process ? static_cast<unsigned long long>(pmc.WorkingSetSize) / MiB : 0ull,
+        have_process ? "yes" : "no");
     MEMORYSTATUSEX system_memory = {};
     system_memory.dwLength = sizeof(system_memory);
     if (GlobalMemoryStatusEx(&system_memory)) {
-        logger::log("SYSTEM MEMORY : available_phys=%lluMiB total_phys=%lluMiB page_faults=%lu (soft+hard)",
+        logger::log("SYSTEM MEMORY : available_phys=%lluMiB total_phys=%lluMiB page_faults=%lu page_faults_available=%s (soft+hard)",
             static_cast<unsigned long long>(system_memory.ullAvailPhys) / MiB,
             static_cast<unsigned long long>(system_memory.ullTotalPhys) / MiB,
-            have_process ? static_cast<unsigned long>(pmc.PageFaultCount) : 0ul);
+            have_process ? static_cast<unsigned long>(pmc.PageFaultCount) : 0ul,
+            have_process ? "yes" : "no");
+    } else {
+        logger::log("SYSTEM MEMORY : available=no available_phys=unknown total_phys=unknown");
     }
+    log_process_cpu();
     log_scan_costs();
     logger::log("MEM HOLES : fit4/8/16/32MiB=%lu/%lu/%lu/%lu complete=%u",
                 static_cast<unsigned long>(snapshot.holes.counts[0]),
@@ -325,26 +362,14 @@ static void log_snapshot(const AddressSpaceSnapshot& snapshot, bool low) {
                 static_cast<unsigned long>(snapshot.holes.counts[2]),
                 static_cast<unsigned long>(snapshot.holes.counts[3]),
                 snapshot.complete ? 1u : 0u);
-    char largest_field[40] = {};
-    if (snapshot.largest_free < MiB) {
-        snprintf(largest_field, sizeof(largest_field), "largest=%lluKiB",
-                 static_cast<unsigned long long>(snapshot.largest_free) / 1024ull);
-    } else {
-        snprintf(largest_field, sizeof(largest_field), "largest=%lluMiB",
-                 static_cast<unsigned long long>(snapshot.largest_free) / MiB);
-    }
     logger::report_memory(
-        "mem free=%lluMiB %s commit=%lluMiB reserve=%lluMiB guard=%luMiB private=%lluMiB ws=%lluMiB req=%lld total=%lluMiB max=%ldKiB",
-        snapshot.free_bytes / MiB,
-        largest_field,
+        "mem free=%lluKiB largest=%lluKiB commit=%lluMiB reserve=%lluMiB guard=%luMiB complete=%u process=%s",
+        snapshot.free_bytes / 1024ull,
+        static_cast<unsigned long long>(snapshot.largest_free) / 1024ull,
         snapshot.committed_bytes / MiB,
         snapshot.reserved_bytes / MiB,
         reserve_mib,
-        have_process ? static_cast<unsigned long long>(pmc.PrivateUsage) / MiB : 0ull,
-        have_process ? static_cast<unsigned long long>(pmc.WorkingSetSize) / MiB : 0ull,
-        static_cast<long long>(count),
-        static_cast<unsigned long long>(requested) / MiB,
-        largest / 1024);
+        snapshot.complete ? 1u : 0u, have_process ? "available" : "unknown");
 }
 
 static DWORD WINAPI monitor_thread(LPVOID) {
@@ -626,8 +651,8 @@ void capture_failure_snapshot(const char* api, std::size_t bytes,
         static_cast<unsigned long>(snapshot.holes.counts[2]),
         static_cast<unsigned long>(snapshot.holes.counts[3]), snapshot.complete ? 1u : 0u);
     logger::report_failure_memory(
-        "mem_fail phase=%.12s free=%lluMiB largest=%lluKiB guard=%luMiB holes4/8/16/32=%lu/%lu/%lu/%lu tick=%lu complete=%u",
-        phase ? phase : "unknown", snapshot.free_bytes / MiB,
+        "mem_fail phase=%.12s free=%lluKiB largest=%lluKiB guard=%luMiB holes4/8/16/32=%lu/%lu/%lu/%lu tick=%lu complete=%u",
+        phase ? phase : "unknown", snapshot.free_bytes / 1024ull,
         static_cast<unsigned long long>(snapshot.largest_free) / 1024ull, guard,
         static_cast<unsigned long>(snapshot.holes.counts[0]),
         static_cast<unsigned long>(snapshot.holes.counts[1]),

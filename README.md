@@ -1,13 +1,16 @@
 # Men of War: Assault Squad 2 Memory Guard
 
 > [!IMPORTANT]
-> This working branch identifies its DLL as `2.5.0-experimental.14`; it is not
+> This working branch identifies its DLL as `2.5.0-experimental.15`; it is not
 > the public stable release. Use the v2.4.2 GitHub release for stable rollback.
 
-Experimental prerelease: [experimental.14](docs/EXPERIMENTAL-14.md) adds sampled
-retention ages, bounded caller traces/code windows and exact context for small
-allocation failures. Full per-request profiling and .13's other additions
-are retained; the light-mode option remains removed. See the
+Diagnostic candidate: [experimental.15](docs/EXPERIMENTAL-15.md) adds matched
+Steam/full reports, an offline analyzer, allocation-size/thread observations
+and an [evidence-first roadmap](docs/EVIDENCE-FIRST-ROADMAP.md) for evaluating
+targeted allocator and resource-lifetime fixes. It retains .14's ages/traces,
+full per-request profiling and all recovery/VAC safeguards. It does not yet
+replace the allocator or reduce graphics quality. The light-mode option
+remains removed. See the
 [lag and heavy-mod investigation](docs/INVESTIGATION-2026-10-21-Lag-And-Mod-Crashes.md)
 for evidence and controlled test instructions. It is not a confirmed fix for
 slow motion, reload leaks or every heavy-mod out-of-memory crash.

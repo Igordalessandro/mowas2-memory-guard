@@ -6,11 +6,11 @@ They are also attached to their corresponding GitHub releases using the same
 filenames.
 
 To check a DLL, run `sha256sum -c` from the directory containing that DLL,
-passing the path to the matching manifest. For the local experimental.13 build,
+passing the path to the matching manifest. For the local experimental.15 build,
 from the repository root:
 
 ```sh
-(cd dist/v2.5.0-experimental.13 && sha256sum -c ../../checksums/SHA256SUMS-v2.5.0-experimental.13.txt)
+(cd dist/v2.5.0-experimental.15 && sha256sum -c ../../checksums/SHA256SUMS-v2.5.0-experimental.15.txt)
 ```
 
 On Windows, compare `Get-FileHash .\dbghelp.dll -Algorithm SHA256` with the

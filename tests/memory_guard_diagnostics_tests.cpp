@@ -23,6 +23,18 @@ unsigned releases = 0;
 bool fail_query = false;
 DWORD fake_tick = 1234567;
 DWORD tick_step = 0;
+bool cpu_query_fails = false;
+ULONGLONG cpu_wall = 1;
+ULONGLONG cpu_time = 0;
+ULONGLONG WINAPI mock_cpu_tick() { return cpu_wall; }
+BOOL WINAPI mock_process_times(HANDLE, LPFILETIME created, LPFILETIME exited,
+                               LPFILETIME kernel, LPFILETIME user) {
+    if (cpu_query_fails) return FALSE;
+    *created = *exited = *kernel = {};
+    user->dwLowDateTime = static_cast<DWORD>(cpu_time);
+    user->dwHighDateTime = static_cast<DWORD>(cpu_time >> 32);
+    return TRUE;
+}
 
 DWORD WINAPI mock_get_last_error() { return test_error; }
 void WINAPI mock_set_last_error(DWORD error) { test_error = error; }
@@ -86,6 +98,8 @@ BOOL WINAPI mock_free(LPVOID address, SIZE_T, DWORD flags) {
 #define GetTickCount mock_tick
 #define VirtualQuery mock_query
 #define VirtualFree mock_free
+#define GetProcessTimes mock_process_times
+#define GetTickCount64 mock_cpu_tick
 #include "../src/orchestration/memory_guard.cpp"
 #undef GetLastError
 #undef SetLastError
@@ -94,6 +108,8 @@ BOOL WINAPI mock_free(LPVOID address, SIZE_T, DWORD flags) {
 #undef GetTickCount
 #undef VirtualQuery
 #undef VirtualFree
+#undef GetProcessTimes
+#undef GetTickCount64
 
 namespace logger {
 void log(const char* fmt, ...) {
@@ -236,5 +252,15 @@ int main() {
     tick_step = 2;
     scan_address_space(ScanKind::preflight);
     assert(cost.calls == 2 && cost.wall_ms == 18 && cost.longest_ms.load() == 16);
+    cpu_query_fails = true;
+    log_process_cpu();
+    assert(messages.back().find("available=no core_pct=unknown") != std::string::npos);
+    cpu_query_fails = false;
+    log_process_cpu();
+    assert(messages.back().find("baseline=1 core_pct=unknown") != std::string::npos);
+    cpu_wall += 100;
+    cpu_time += 1000000;
+    log_process_cpu();
+    assert(messages.back().find("span_ms=100 cpu_us=100000 core_pct=100.00") != std::string::npos);
     return 0;
 }

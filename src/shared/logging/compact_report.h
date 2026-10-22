@@ -16,6 +16,8 @@ struct Fields {
     const char* allocator;
     const char* hotspot;
     const char* event;
+    const char* full_log = nullptr;
+    const char* coverage = nullptr;
 };
 
 inline bool append_line(char* output, std::size_t limit, std::size_t& used,
@@ -46,10 +48,13 @@ inline std::size_t build(char* output, std::size_t capacity, const Fields& field
     const char* essential[] = {fields.session, fields.crash, fields.failure, fields.memory};
     for (const char* line : essential) append_line(output, limit, used, line);
 
+    // Correlation is essential: budget it before optional details can consume
+    // the remaining space. Actual production core buffers leave room for it.
+    append_line(output, limit, used, fields.full_log);
     constexpr char omitted[] = "omitted=optional_fields";
     constexpr std::size_t marker_bytes = sizeof(omitted) - 1 + 2;
     const std::size_t optional_limit = limit >= marker_bytes ? limit - marker_bytes : 0;
-    const char* optional[] = {fields.config, fields.allocator, fields.hotspot, fields.event};
+    const char* optional[] = {fields.hotspot, fields.coverage, fields.config, fields.allocator, fields.event};
     bool did_omit = false;
     for (const char* line : optional) {
         if (!append_line(output, optional_limit, used, line)) did_omit = true;

@@ -79,6 +79,12 @@ void previous_reports_survive() {
     write(L"DLL Crash Report.txt", "prior compact report\r\n");
     write(L"DLL Emergency Crash.txt", "prior emergency report\r\n");
     assert(logger::init());
+    const std::string header = read(L"DLL Crash Report.txt");
+    assert(header.find("fmt=2") != std::string::npos);
+    assert(header.find("exp=off") != std::string::npos);
+    assert(header.find("sid=") != std::string::npos);
+    assert(header.find("full_log=mowas2-memory-guard-") != std::string::npos);
+    assert(header.find(logger::g_sessionId) != std::string::npos);
     assert(read(L"DLL Crash Report.previous.txt") == "prior compact report\r\n");
     assert(read(L"DLL Emergency Crash.previous.txt") == "prior emergency report\r\n");
     logger::report_crash("crash=unhandled code=C0000005 thread=4294967295");
@@ -150,6 +156,15 @@ void failed_backup_does_not_destroy_original() {
     close_logger();
 }
 
+void unvalidated_experiment_stays_off() {
+    close_logger();
+    assert(SetEnvironmentVariableA("MOWAS2_EXPERIMENT", "targeted-allocator"));
+    assert(logger::init());
+    assert(std::strcmp(logger::g_experimentStatus, "refused_unvalidated") == 0);
+    assert(read(L"DLL Crash Report.txt").find("exp=off") != std::string::npos);
+    assert(SetEnvironmentVariableA("MOWAS2_EXPERIMENT", nullptr));
+}
+
 void cleanup() {
     WIN32_FIND_DATAW data = {};
     HANDLE search = FindFirstFileW(path(L"*").c_str(), &data);
@@ -176,6 +191,7 @@ int main() {
     assert(_snwprintf_s(fake_module, MAX_PATH, _TRUNCATE, L"%s\\dbghelp.dll", directory) > 0);
     previous_reports_survive();
     busy_lock_still_records_emergency();
+    unvalidated_experiment_stays_off();
     failed_backup_does_not_destroy_original();
     cleanup();
     std::puts("logger tests passed");
